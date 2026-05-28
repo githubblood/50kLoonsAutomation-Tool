@@ -1,0 +1,68 @@
+# ============================================================
+#  Lead Automation — Master Configuration
+# ============================================================
+
+# --- Target Form ---
+target:
+  url: "https://spaxads.gotrackier.com/click?campaign_id=1128&pub_id=2"  # Target URL
+
+  # The form is a multi-step iframe form — selectors are hardcoded in form_filler.py
+  # (form_fields section not used for this target)
+
+  # Timeout (seconds) to wait for navigation
+  page_timeout: 60
+
+# --- Retry & Backoff ---
+retry:
+  max_retries: 3                # Max attempts per row
+  backoff_base: 2               # Exponential backoff base (seconds)
+  backoff_max: 30               # Cap on backoff delay
+
+# --- Delays (seconds) — human-like pacing ---
+delays:
+  min_typing_delay: 0.04        # Min delay between keystrokes
+  max_typing_delay: 0.12        # Max delay between keystrokes
+  min_action_delay: 0.5         # Min pause between form actions
+  max_action_delay: 2.0         # Max pause between form actions
+  page_load_wait: 3             # Extra wait after page load
+  pre_submit_wait: 1.5          # Pause before clicking submit
+
+# --- Device Emulation Defaults ---
+# These apply when Use_Custom_Device != "yes" in the sheet
+device_defaults:
+  random_viewport: true
+  random_locale: true
+  random_timezone: true
+  random_color_scheme: true
+  viewport_width_range: [360, 430]
+  viewport_height_range: [640, 932]
+  device_scale_factor_range: [2.0, 3.5]
+
+# --- Screenshots ---
+screenshots:
+  on_failure: true
+  on_success: false
+  directory: "screenshots"
+
+# --- Logging ---
+logging:
+  level: "INFO"                 # DEBUG | INFO | WARNING | ERROR
+  log_file: "logs/automation.log"
+  console: true
+  json_logs: false              # Set true for machine-parseable JSON lines
+
+# --- Google Sheet Column Mapping ---
+# Map internal field names → actual column headers in your sheet.
+# Change the VALUES here to match your sheet's column names exactly.
+sheet_columns:
+  status: "Status"
+  notes: "Notes"
+  proxy_used: "Proxy_Used"
+  ip: "IP"
+  last_attempt: "Last_Attempt"
+  retry_count: "Retry_Count"
+  submission_id: "Submission_ID"
+  device_model: "Device_Model"
+  android_version: "Android_Version"
+  orientation: "Orientation"
+  use_custom_device: "Use_Custom_Device"

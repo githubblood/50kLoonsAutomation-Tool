@@ -1,0 +1,778 @@
+"""
+core/form_filler.py — LowCreditFinance multi-step iframe form automation.
+
+Handles all 28 steps of the lowcreditfinance.com application form:
+  Step 1:  Loan Amount (button)
+  Step 2:  Email
+  Step 3:  Last 4 SSN
+  Step 4:  Verification interstitial (auto-advance)
+  Step 5:  Credit Score (button)
+  Step 6:  Name (first/last)
+  Step 7:  Date of Birth
+  Step 8:  ZIP Code
+  Step 9:  Address (street, city, state)
+  Step 10: Income Source (button)
+  Step 11: Active Military (button)
+  Step 12: Pay Frequency (button)
+  Step 13: Monthly Income
+  Step 14: Next Payday (pre-filled date)
+  Step 15: Employer Information (3 unnamed inputs)
+  Step 16: Paycheck Received (button)
+  Step 17: ABA Routing Number
+  Step 18: Bank Name
+  Step 19: Account Type (button)
+  Step 20: Account Age (button)
+  Step 21: Account Number
+  Step 22: Driver's License (number + state)
+  Step 23: Loan Purpose (button)
+  Step 24: Phone Number (unnamed tel input)
+  Step 25: Full SSN (3 parts: ssn_1, ssn_2, ssn_3)
+  Step 26: Free Credit Report offer (button)
+  Step 27: Unsecured Debt question (button)
+  Step 28: Submit + Processing
+"""
+from __future__ import annotations
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import structlog
+from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page
+
+from utils.stealth import inject_stealth, random_pause
+from utils.proxy_manager import ProxyManager
+
+log = structlog.get_logger(__name__)
+
+
+class FormFillerError(Exception):
+    """Base exception for form filling errors."""
+    def __init__(self, message: str, error_type: str = "unknown"):
+        super().__init__(message)
+        self.error_type = error_type
+
+
+class FormFiller:
+    """Fills and submits the LowCreditFinance multi-step iframe form."""
+
+    # Pay-frequency canonical map (sheet value → button text)
+    _PAY_FREQ_MAP = {
+        "weekly":        "Weekly",
+        "biweekly":      "Bi-Weekly (Every 2 Weeks)",
+        "bi-weekly":     "Bi-Weekly (Every 2 Weeks)",
+        "bi weekly":     "Bi-Weekly (Every 2 Weeks)",
+        "every 2 weeks": "Bi-Weekly (Every 2 Weeks)",
+        "twicemonthly":  "Twice Monthly (1st & 15th)",
+        "twice monthly": "Twice Monthly (1st & 15th)",
+        "semi-monthly":  "Twice Monthly (1st & 15th)",
+        "monthly":       "Monthly",
+    }
+
+    # Credit score canonical map
+    _CREDIT_MAP = {
+        "excellent": "Excellent•720+",
+        "720":       "Excellent•720+",
+        "good":      "Good•660 - 719",
+        "660":       "Good•660 - 719",
+        "fair":      "Fair•600 - 659",
+        "600":       "Fair•600 - 659",
+        "poor":      "Poor•Below 600",
+        "below":     "Poor•Below 600",
+    }
+
+    def __init__(self, config: dict) -> None:
+        self._config = config
+        self._target = config.get("target", {})
+        self._ss_dir = Path(config.get("screenshots", {}).get("directory", "screenshots"))
+        self._ss_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def process_row(
+        self,
+        row: dict[str, Any],
+        fingerprint: dict[str, Any],
+        proxy_url: str | None,
+        row_number: int,
+    ) -> dict[str, Any]:
+        """Fill and submit the form for one sheet row.
+
+        Returns:
+            {"status": "Success"|"Failed", "notes": "...", "submission_id": "..."}
+        """
+        headless = os.getenv("HEADLESS", "true").lower() == "true"
+        fields = self._parse_fields(row)
+
+        with sync_playwright() as pw:
+            launch_args: dict[str, Any] = {"headless": headless}
+            if proxy_url:
+                launch_args["proxy"] = ProxyManager.to_playwright_proxy(proxy_url)
+
+            browser: Browser = pw.chromium.launch(**launch_args)
+            try:
+                ctx_args = self._clean_fingerprint(fingerprint)
+                context: BrowserContext = browser.new_context(**ctx_args)
+                page: Page = context.new_page()
+                inject_stealth(page)
+
+                url = self._target.get("url", "https://lowcreditfinance.com/?aff102137")
+                log.info("form.navigating", url=url, row=row_number)
+                page.goto(url, wait_until="networkidle", timeout=60000)
+
+                # Wait up to 30s for iframe.global to appear (JS-injected, can be slow via proxy)
+                frame = None
+                for _wait in range(30):
+                    for f in page.frames:
+                        if "iframe.global" in f.url:
+                            frame = f
+                            break
+                    if frame is not None:
+                        break
+                    time.sleep(1)
+                if frame is None:
+                    raise FormFillerError("iframe.global not found on page", "element_not_found")
+
+                log.info("form.iframe_found", url=frame.url, row=row_number)
+                self._fill_form(frame, page, fields, row_number)
+
+                # Take success screenshot
+                self._screenshot(page, row_number, "success")
+                submission_id = str(uuid.uuid4())[:8].upper()
+                log.info("form.success", row=row_number, submission_id=submission_id)
+                context.close()
+                return {
+                    "status": "Success",
+                    "notes": "Form submitted — processing screen reached",
+                    "submission_id": submission_id,
+                }
+
+            except FormFillerError as exc:
+                try:
+                    if "page" in locals():
+                        self._screenshot(page, row_number, exc.error_type or "error")
+                except Exception:
+                    pass
+                raise
+            except Exception as exc:
+                error_type = self._classify_error(exc)
+                try:
+                    if "page" in locals():
+                        self._screenshot(page, row_number, error_type)
+                except Exception:
+                    pass
+                raise FormFillerError(str(exc), error_type=error_type) from exc
+            finally:
+                browser.close()
+
+    # ── form flow ─────────────────────────────────────────────────────
+
+    def _fill_form(self, frame, page, f: dict, row_number: int) -> None:
+        """Execute all 28 form steps sequentially."""
+
+        log.info("form.step", step=1, name="loan_amount", row=row_number)
+        self._js_click_opt(frame, f["loan_amount"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=2, name="email", row=row_number)
+        self._react_fill(frame, "input[name='email']", f["email"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=3, name="last_ssn", row=row_number)
+        # SSN verification step — only shown with affiliate tracking code; skip if absent
+        try:
+            frame.locator("input[name='last_ssn']").wait_for(state="visible", timeout=12000)
+            self._react_fill(frame, "input[name='last_ssn']", f["last_ssn"])
+            self._click_submit(frame)
+            time.sleep(8)  # verification interstitial — wait for it to pass
+        except Exception:
+            log.info("form.step3_skipped", row=row_number, reason="last_ssn not shown")
+
+        # --- Early-exit: form may jump directly to the final "Request Cash" page ---
+        _body_after_ssn = frame.evaluate("() => document.body.innerText.toLowerCase()")
+        if "request cash" in _body_after_ssn or "submit loan request" in _body_after_ssn:
+            log.info("form.early_submit", row=row_number, reason="form_jumped_to_submit_after_ssn")
+            # Wait for TrustedForm to populate its cert URL (up to 30s)
+            _tf_val = ""
+            for _tf in range(30):
+                _tf_val = frame.evaluate("() => { const el = document.querySelector('input[name=\"xxTrustedFormCertUrl\"]'); return el ? el.value : ''; }")
+                if _tf_val:
+                    break
+                time.sleep(1)
+            log.info("form.trustedform", cert_url=_tf_val[:60] if _tf_val else "empty", row=row_number)
+            # Expand consent text by clicking "Read more" (required before Request Cash)
+            frame.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button'));
+                const rm = btns.find(b => /read more/i.test(b.textContent.trim()));
+                if (rm) rm.click();
+            }""")
+            time.sleep(1)
+            frame.evaluate("""() => {
+                const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+                boxes.forEach(cb => { if (!cb.checked) cb.click(); });
+            }""")
+            time.sleep(0.5)
+            # Use Playwright native click (simulates real mouse events for React)
+            try:
+                btn_loc = frame.locator("button.lcf-btn-primary").first
+                btn_loc.scroll_into_view_if_needed()
+                btn_loc.click(timeout=10000)
+            except Exception:
+                frame.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    const btn = btns.find(b => /request cash/i.test(b.textContent.trim()));
+                    if (btn) { btn.click(); return; }
+                    const p = document.querySelector('button.lcf-btn-primary');
+                    if (p) p.click();
+                }""")
+            log.info("form.submit_clicked", button="request_cash", row=row_number)
+            time.sleep(20)
+            body = frame.evaluate("() => document.body.innerText.toLowerCase()")
+            log.info("form.post_submit_body", body=body[:200], row=row_number)
+            success_kws = [
+                "processing", "reviewing", "hang tight", "finding",
+                "thank you", "congratulations", "submitted", "we'll review",
+                "offers", "results", "your request", "lenders",
+            ]
+            if not any(kw in body for kw in success_kws):
+                raise FormFillerError(
+                    f"Unexpected page after early submit: {body[:200]}", "submit_failed"
+                )
+            return  # Done — skip all remaining steps
+
+        log.info("form.step", step=5, name="credit_score", row=row_number)
+        # Wait up to 30s for lcf-option buttons to appear (proxy can be slow)
+        try:
+            frame.locator("button.lcf-option").first.wait_for(state="visible", timeout=30000)
+        except Exception:
+            pass
+        self._js_click_opt(frame, f["credit_score"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=6, name="name", row=row_number)
+        self._react_fill(frame, "input[name='fname']", f["fname"])
+        self._react_fill(frame, "input[name='lname']", f["lname"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=7, name="dob", row=row_number)
+        self._react_fill(frame, "input[name='dob_month']", f["dob_month"])
+        self._react_fill(frame, "input[name='dob_day']",   f["dob_day"])
+        self._react_fill(frame, "input[name='dob_year']",  f["dob_year"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=8, name="zip", row=row_number)
+        self._react_fill(frame, "input[name='zip']", f["zip"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=9, name="address", row=row_number)
+        self._react_fill(frame, "input[name='street_address']", f["street_address"])
+        self._react_fill(frame, "input[name='city']",            f["city"])
+        frame.locator("select[name='state']").select_option(value=f["state"])
+        time.sleep(0.5)
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=10, name="income_source", row=row_number)
+        self._js_click_opt(frame, f["income_source"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=11, name="military", row=row_number)
+        self._js_click_opt(frame, f["military"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=12, name="pay_frequency", row=row_number)
+        # Exact match required — "Monthly" must not match "Twice Monthly"
+        self._js_click_exact(frame, f["pay_frequency"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=13, name="monthly_income", row=row_number)
+        self._react_fill(frame, "input[name='monthly_income']", f["monthly_income"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=14, name="next_payday", row=row_number)
+        # Date is pre-filled; just continue
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=15, name="employer_info", row=row_number)
+        vals = [f["employer_name"], f["job_title"], f["employer_phone"]]
+        for idx, val in enumerate(vals):
+            frame.evaluate("""([idx, val]) => {
+                const inputs = Array.from(document.querySelectorAll('input.lcf-input'));
+                const el = inputs[idx];
+                if (!el) return;
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""", [idx, val])
+            time.sleep(0.1)
+        time.sleep(0.3)
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=16, name="paycheck_type", row=row_number)
+        self._js_click_opt(frame, f["paycheck_type"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=17, name="routing_number", row=row_number)
+        self._react_fill(frame, "input[name='routing_number']", f["routing_number"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=18, name="bank_name", row=row_number)
+        self._react_fill(frame, "input[name='bank_name']", f["bank_name"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=19, name="account_type", row=row_number)
+        self._js_click_opt(frame, f["account_type"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=20, name="account_age", row=row_number)
+        self._js_click_opt(frame, f["account_age"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=21, name="account_number", row=row_number)
+        self._react_fill(frame, "input[name='bank_account_number']", f["account_number"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=22, name="drivers_license", row=row_number)
+        self._react_fill(frame, "input[name='drivers_license_number']", f["dl_number"])
+        # Try value first (2-letter code), then label (full name), then JS partial match
+        dl_sel = frame.locator("select[name='drivers_license_state']")
+        try:
+            dl_sel.select_option(value=f["dl_state"], timeout=5000)
+        except Exception:
+            try:
+                dl_sel.select_option(label=f["dl_state"], timeout=5000)
+            except Exception:
+                # JS fallback: select by matching option value or text case-insensitively
+                frame.evaluate("""([code]) => {
+                    const sel = document.querySelector("select[name='drivers_license_state']");
+                    if (!sel) return;
+                    const opt = Array.from(sel.options).find(o =>
+                        o.value.toLowerCase() === code.toLowerCase() ||
+                        o.text.toLowerCase() === code.toLowerCase()
+                    );
+                    if (opt) {
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""", [f["dl_state"]])
+        time.sleep(0.3)
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=23, name="loan_purpose", row=row_number)
+        self._js_click_opt(frame, f["loan_purpose"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=24, name="phone", row=row_number)
+        # Phone inputs may be masked — type char-by-char to properly trigger React state
+        tel = frame.locator("input[type='tel']")
+        tel.click()
+        tel.fill("")
+        tel.type(f["phone"], delay=40)
+        frame.evaluate("() => { const el = document.querySelector(\"input[type='tel']\"); if (el) el.dispatchEvent(new Event('blur', { bubbles: true })); }")
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=25, name="full_ssn", row=row_number)
+        self._react_fill(frame, "input[name='ssn_1']", f["ssn_1"])
+        self._react_fill(frame, "input[name='ssn_2']", f["ssn_2"])
+        self._react_fill(frame, "input[name='ssn_3']", f["ssn_3"])
+        self._click_continue(frame)
+        self._wait_step(frame)
+
+        log.info("form.step", step=26, name="credit_report_offer", row=row_number)
+        try:
+            self._js_click_opt(frame, f["credit_report_offer"])
+        except FormFillerError:
+            # Step 26 may use non-lcf-option buttons (links, anchor tags, or other buttons)
+            frame.evaluate("""(txt) => {
+                const want = txt.toLowerCase();
+                const all = Array.from(document.querySelectorAll('button,a[href="#"],a[role="button"]'));
+                const match = all.find(el => el.textContent.trim().toLowerCase().includes(want));
+                if (match) { match.click(); return; }
+                // fallback: click first button-like element
+                if (all[0]) all[0].click();
+            }""", f["credit_report_offer"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=27, name="debt_over_10k", row=row_number)
+        try:
+            self._js_click_opt(frame, f["debt_over_10k"])
+        except FormFillerError:
+            frame.evaluate("""(txt) => {
+                const want = txt.toLowerCase();
+                const all = Array.from(document.querySelectorAll('button,a[href="#"],a[role="button"]'));
+                const match = all.find(el => el.textContent.trim().toLowerCase().includes(want));
+                if (match) { match.click(); return; }
+                if (all[0]) all[0].click();
+            }""", f["debt_over_10k"])
+        self._wait_step(frame)
+
+        log.info("form.step", step=28, name="submit", row=row_number)
+        # After debt_over_10k, the form may cycle through: phone reconfirm, credit report offer,
+        # debt question (again), before reaching the final submit button.
+        # Loop up to 6 passes to handle any intermediate pages.
+        for _pass in range(6):
+            body_now = frame.evaluate("() => document.body.innerText.toLowerCase()")
+
+            # Phone reconfirm page
+            if "phone" in body_now and ("what's your phone" in body_now or "phone number" in body_now):
+                log.info("form.step", step=28, name="phone_reconfirm", row=row_number)
+                tel = frame.locator("input[type='tel']")
+                tel.click()
+                tel.fill("")
+                tel.type(f["phone"], delay=40)
+                frame.evaluate("() => { const el = document.querySelector(\"input[type='tel']\"); if (el) el.dispatchEvent(new Event('blur', { bubbles: true })); }")
+                self._click_continue(frame)
+                self._wait_step(frame)
+                continue
+
+            # Credit report offer page — always click Yes then Continue
+            if "credit report" in body_now or "7-day trial" in body_now or "free 7-day" in body_now:
+                log.info("form.step", step=28, name="credit_report_loop", row=row_number)
+                # Click "Yes" option first, then click Continue to advance
+                frame.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button.lcf-option,button'));
+                    const yes = btns.find(b => b.textContent.trim().toLowerCase() === 'yes');
+                    if (yes) { yes.click(); return; }
+                    if (btns[0]) btns[0].click();
+                }""")
+                time.sleep(0.5)
+                try:
+                    self._click_continue(frame)
+                except Exception:
+                    pass
+                self._wait_step(frame)
+                continue
+
+            # Debt question page — click Yes then Continue
+            if "debt" in body_now and "10" in body_now:
+                log.info("form.step", step=28, name="debt_loop", row=row_number)
+                frame.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button.lcf-option,button'));
+                    const yes = btns.find(b => b.textContent.trim().toLowerCase() === 'yes');
+                    if (yes) { yes.click(); return; }
+                    if (btns[0]) btns[0].click();
+                }""")
+                time.sleep(0.5)
+                try:
+                    self._click_continue(frame)
+                except Exception:
+                    pass
+                self._wait_step(frame)
+                continue
+
+            # None of the above — should be the final submit page, exit loop
+            break
+
+        # Check any unchecked checkboxes on the review/consent page before submitting
+        frame.evaluate("""() => {
+            const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+            boxes.forEach(cb => { if (!cb.checked) cb.click(); });
+        }""")
+        time.sleep(0.5)
+
+        # The submit button says "Request Cash" — click it (try _click_continue first)
+        submitted = frame.evaluate("""() => {
+            const btns = Array.from(document.querySelectorAll('button'));
+            const btn = btns.find(b => /request cash/i.test(b.textContent.trim()));
+            if (btn) { btn.click(); return 'request_cash'; }
+            const p = document.querySelector('button.lcf-btn-primary:not([disabled]),button[type="submit"]');
+            if (p) { p.click(); return 'primary'; }
+            return null;
+        }""")
+        if not submitted:
+            raise FormFillerError("Submit button not found", "element_not_found")
+        log.info("form.submit_clicked", button=submitted, row=row_number)
+        time.sleep(15)  # wait for processing/redirect via proxy (can be slow)
+
+        # Verify we reached the processing / results page
+        body = frame.evaluate("() => document.body.innerText.toLowerCase()")
+        success_kws = [
+            "processing", "reviewing", "hang tight", "finding",
+            "thank you", "congratulations", "submitted", "we'll review",
+            "offers", "results", "your request", "lenders",
+        ]
+        if not any(kw in body for kw in success_kws):
+            raise FormFillerError(
+                f"Unexpected page after submit: {body[:200]}", "submit_failed"
+            )
+
+    # ── field parser ──────────────────────────────────────────────────
+
+    # US state name → 2-letter code
+    _STATE_CODES = {
+        "alabama":"AL","alaska":"AK","arizona":"AZ","arkansas":"AR","california":"CA",
+        "colorado":"CO","connecticut":"CT","delaware":"DE","florida":"FL","georgia":"GA",
+        "hawaii":"HI","idaho":"ID","illinois":"IL","indiana":"IN","iowa":"IA",
+        "kansas":"KS","kentucky":"KY","louisiana":"LA","maine":"ME","maryland":"MD",
+        "massachusetts":"MA","michigan":"MI","minnesota":"MN","mississippi":"MS",
+        "missouri":"MO","montana":"MT","nebraska":"NE","nevada":"NV",
+        "new hampshire":"NH","new jersey":"NJ","new mexico":"NM","new york":"NY",
+        "north carolina":"NC","north dakota":"ND","ohio":"OH","oklahoma":"OK",
+        "oregon":"OR","pennsylvania":"PA","rhode island":"RI","south carolina":"SC",
+        "south dakota":"SD","tennessee":"TN","texas":"TX","utah":"UT","vermont":"VT",
+        "virginia":"VA","washington":"WA","west virginia":"WV","wisconsin":"WI",
+        "wyoming":"WY","district of columbia":"DC",
+    }
+
+    def _parse_fields(self, row: dict[str, Any]) -> dict[str, str]:
+        """Extract and normalise all form fields from a sheet row."""
+        g = lambda *keys: self._get(row, *keys)
+
+        # Loan amount — normalise to exact button text ("$1,000" etc.)
+        loan_raw = g("Loan_Amount", "loan_amount", "Amount", "amount") or "5000"
+        loan_amount = self._normalise_loan_amount(loan_raw)
+
+        # Pay frequency
+        pay_raw = (g("Pay_Frequency", "pay_frequency", "Pay_Freq", "PayFrequency") or "monthly").strip().lower()
+        pay_freq = self._PAY_FREQ_MAP.get(pay_raw, "Monthly")
+
+        # Credit score
+        credit_raw = (g("Credit_Score", "credit_score", "CreditScore") or "poor").strip().lower()
+        credit_score = next(
+            (v for k, v in self._CREDIT_MAP.items() if k in credit_raw),
+            "Poor•Below 600",
+        )
+
+        # SSN parsing — full SSN (xxx-xx-xxxx) split into 3 parts
+        ssn_full = re.sub(r"\D", "", g("SSN", "ssn", "Full_SSN", "full_ssn") or "")
+        if len(ssn_full) == 9:
+            ssn_1, ssn_2, ssn_3 = ssn_full[:3], ssn_full[3:5], ssn_full[5:]
+        else:
+            ssn_1 = g("SSN_1", "ssn_1") or ""
+            ssn_2 = g("SSN_2", "ssn_2") or ""
+            ssn_3 = g("SSN_3", "ssn_3") or ""
+
+        # Last 4 SSN — prefer explicit field, fallback to last 4 of full SSN
+        last_ssn = g("Last_SSN", "last_ssn", "SSN_Last4") or ssn_3 or ssn_full[-4:]
+
+        # DOB — accept YYYY-MM-DD (ISO), MM/DD/YYYY, or individual fields
+        dob = g("DOB", "dob", "Date_of_Birth", "DateOfBirth") or ""
+        dob_month = g("DOB_Month", "dob_month") or ""
+        dob_day   = g("DOB_Day",   "dob_day")   or ""
+        dob_year  = g("DOB_Year",  "dob_year")  or ""
+        if dob and not dob_month:
+            parts = re.split(r"[/\-]", dob.strip())
+            if len(parts) == 3:
+                if len(parts[0]) == 4:          # YYYY-MM-DD (ISO format)
+                    dob_year, dob_month, dob_day = parts[0], parts[1], parts[2]
+                else:                           # MM/DD/YYYY
+                    dob_month, dob_day, dob_year = parts[0], parts[1], parts[2]
+
+        # State — derive from bankState (full name) or State column (2-letter)
+        state_raw = g("State", "state") or ""
+        bank_state_raw = g("bankState", "bank_state", "BankState") or ""
+        state = self._resolve_state(state_raw or bank_state_raw) or "TX"
+
+        # DL state — prefer explicit DL_State, fallback to derived state
+        dl_state_raw = g("DL_State", "dl_state", "DL_State_Code") or bank_state_raw or state_raw
+        dl_state = self._resolve_state(dl_state_raw) or state
+
+        # Account type normalisation ("CHECKING" → "Checking", "SAVINGS" → "Savings")
+        acct_type_raw = g("Account_Type", "account_type", "AccountType", "bankAccountType") or "Checking"
+        acct_type = acct_type_raw.strip().capitalize() if acct_type_raw.strip().upper() in ("CHECKING","SAVINGS") else "Checking"
+
+        # Employer phone — fall back to the applicant's phone if not provided
+        employer_phone_raw = g("Employer_Phone", "employer_phone", "EmployerPhone") or ""
+        if not employer_phone_raw:
+            employer_phone_raw = g("Phone", "phone") or ""
+
+        return {
+            "loan_amount":       loan_amount,
+            "email":             g("Email", "email") or "",
+            "last_ssn":          last_ssn[-4:] if len(last_ssn) >= 4 else last_ssn,
+            "credit_score":      credit_score,
+            "fname":             g("First_Name", "fname", "first_name", "FirstName") or "",
+            "lname":             g("Last_Name",  "lname", "last_name",  "LastName")  or "",
+            "dob_month":         dob_month.zfill(2) if dob_month else "01",
+            "dob_day":           dob_day.zfill(2)   if dob_day   else "01",
+            "dob_year":          dob_year            if dob_year  else "1990",
+            "zip":               g("ZIP", "zip", "Zip", "Zip_Code", "zip_code", "ZipCode") or "",
+            "street_address":    g("Street_Address", "street_address", "Address", "address") or "",
+            "city":              g("City", "city") or "Dallas",
+            "state":             state,
+            "income_source":     g("Income_Source", "income_source", "IncomeSource") or "Job income",
+            "military":          g("Military", "military", "Active_Military") or "No",
+            "pay_frequency":     pay_freq,
+            "monthly_income":    re.sub(r"[^\d]", "", g("Monthly_Income", "monthly_income", "MonthlyIncome") or "3500") or "3500",
+            "employer_name":     g("Employer_Name", "employer_name", "EmployerName") or "Employer",
+            "job_title":         g("Job_Title", "job_title", "JobTitle", "Title") or "Employee",
+            "employer_phone":    re.sub(r"\D", "", employer_phone_raw),
+            "paycheck_type":     g("Paycheck_Type", "paycheck_type", "PaycheckType") or "Direct Deposit",
+            "routing_number":    re.sub(r"\D", "", g("Routing_Number", "routing_number", "RoutingNumber", "routingNumber") or ""),
+            "bank_name":         g("Bank_Name", "bank_name", "BankName", "bankName") or "",
+            "account_type":      acct_type,
+            "account_age":       g("Account_Age", "account_age", "AccountAge") or "More than 2 Years",
+            "account_number":    re.sub(r"\D", "", g("Account_Number", "account_number", "AccountNumber", "accountNumber", "Bank_Account_Number") or ""),
+            "dl_number":         g("DL_Number", "dl_number", "Drivers_License", "drivers_license_number", "driversLicenseNumber") or "",
+            "dl_state":          dl_state,
+            "loan_purpose":      g("Loan_Purpose", "loan_purpose", "LoanPurpose") or "Personal",
+            "phone":             re.sub(r"\D", "", g("Phone", "phone", "Phone_Number", "Cell_Phone") or ""),
+            "ssn_1":             ssn_1,
+            "ssn_2":             ssn_2,
+            "ssn_3":             ssn_3,
+            "credit_report_offer": g("Credit_Report_Offer", "credit_report_offer") or "No",
+            "debt_over_10k":     g("Debt_Over_10k", "debt_over_10k", "DebtOver10k") or "No",
+        }
+
+    def _resolve_state(self, raw: str) -> str:
+        """Convert state name or code to 2-letter uppercase abbreviation."""
+        raw = raw.strip()
+        if not raw:
+            return ""
+        # Already a 2-letter code?
+        if len(raw) == 2 and raw.isalpha():
+            return raw.upper()
+        # Try lookup in full-name map (strip trailing qualifiers like ", North")
+        key = raw.lower().split(",")[0].strip()
+        code = self._STATE_CODES.get(key)
+        if code:
+            return code
+        # Try partial match
+        for name, abbr in self._STATE_CODES.items():
+            if name in key or key in name:
+                return abbr
+        return raw[:2].upper()  # last resort
+
+    @staticmethod
+    def _normalise_loan_amount(raw: str) -> str:
+        """Convert '5000', '5,000', '$5000' → '$5,000' (matching button text)."""
+        digits = re.sub(r"\D", "", str(raw))
+        if not digits:
+            return "$5,000"
+        amount = int(digits)
+        valid = [1000, 1500, 2000, 2500, 5000, 7500, 10000]
+        # Round to nearest valid option
+        closest = min(valid, key=lambda x: abs(x - amount))
+        return f"${closest:,}"
+
+    @staticmethod
+    def _get(row: dict[str, Any], *keys: str) -> str | None:
+        """Case-insensitive key lookup — tries multiple key names."""
+        row_lower = {k.lower(): v for k, v in row.items()}
+        for key in keys:
+            val = row_lower.get(key.lower())
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        return None
+
+    # ── iframe interaction helpers ────────────────────────────────────
+
+    @staticmethod
+    def _react_fill(frame, selector: str, value: str) -> None:
+        """Fill a React-controlled input using JS nativeInputValueSetter to trigger onChange."""
+        frame.evaluate("""([sel, val]) => {
+            const el = document.querySelector(sel);
+            if (!el) return;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype, 'value').set;
+            nativeInputValueSetter.call(el, val);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }""", [selector, value])
+
+    @staticmethod
+    def _js_click_opt(frame, text: str) -> None:
+        """Click button.lcf-option that contains the given text (JS, bypasses interception)."""
+        clicked = frame.evaluate("""(txt) => {
+            const btns = Array.from(document.querySelectorAll('button.lcf-option'));
+            const btn = btns.find(b => b.textContent.trim().toLowerCase().includes(txt.toLowerCase()));
+            if (btn) { btn.click(); return txt; }
+            if (btns[0]) { btns[0].click(); return 'fallback:' + btns[0].textContent.trim(); }
+            return null;
+        }""", text)
+        if clicked is None:
+            raise FormFillerError(f"No lcf-option buttons found (looking for: {text!r})", "element_not_found")
+        if clicked.startswith("fallback:"):
+            log.warning("form.button_fallback", wanted=text, used=clicked[9:])
+
+    @staticmethod
+    def _js_click_exact(frame, text: str) -> None:
+        """Click button.lcf-option with exact text match (for 'Monthly' vs 'Twice Monthly')."""
+        frame.evaluate("""(txt) => {
+            const btns = Array.from(document.querySelectorAll('button.lcf-option'));
+            const btn = btns.find(b => b.textContent.trim() === txt);
+            if (btn) { btn.click(); return; }
+            // fallback: contains
+            const fb = btns.find(b => b.textContent.trim().toLowerCase().includes(txt.toLowerCase()));
+            if (fb) fb.click();
+        }""", text)
+
+    @staticmethod
+    def _click_continue(frame, timeout: int = 5000) -> None:
+        """Click the primary Continue button — waits up to timeout ms for it to become enabled."""
+        # Wait up to timeout for the primary button to be enabled
+        try:
+            frame.locator("button.lcf-btn-primary:not([disabled])").wait_for(
+                state="visible", timeout=timeout
+            )
+        except Exception:
+            pass  # click anyway
+        frame.evaluate("""() => {
+            const sels = ['button.lcf-btn-primary', 'button[type="submit"]'];
+            for (const sel of sels) {
+                const btn = document.querySelector(sel);
+                if (btn && !btn.disabled) { btn.click(); return; }
+            }
+            // fallback: any button containing continue/submit/next
+            const btns = Array.from(document.querySelectorAll('button'));
+            const btn = btns.find(b => !b.disabled && /continue|submit|next/i.test(b.textContent));
+            if (btn) btn.click();
+        }""")
+
+    @staticmethod
+    def _click_submit(frame) -> None:
+        """Click the submit button (used at SSN verification step)."""
+        frame.evaluate("""() => {
+            const btn = document.querySelector('button[type="submit"]') ||
+                        document.querySelector('button.lcf-btn-primary');
+            if (btn) btn.click();
+        }""")
+
+    @staticmethod
+    def _wait_step(frame, seconds: float = 3.0) -> None:
+        """Wait for the form to advance to the next step."""
+        time.sleep(seconds)
+
+    # ── misc helpers ──────────────────────────────────────────────────
+
+    def _screenshot(self, page: Page, row_number: int, label: str) -> None:
+        path = self._ss_dir / f"row_{row_number}_{label}.png"
+        try:
+            page.screenshot(path=str(path), full_page=True)
+            log.info("screenshot.saved", path=str(path))
+        except Exception as e:
+            log.warning("screenshot.failed", error=str(e))
+
+    @staticmethod
+    def _clean_fingerprint(fp: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in fp.items() if not k.startswith("_")}
+
+    @staticmethod
+    def _classify_error(exc: Exception) -> str:
+        msg = str(exc).lower()
+        if "timeout" in msg or "Timeout" in type(exc).__name__:
+            return "timeout"
+        if "net::" in msg or "ERR_PROXY" in str(exc):
+            return "proxy_failed"
+        if "captcha" in msg or "recaptcha" in msg:
+            return "captcha"
+        if "selector" in msg or "not found" in msg:
+            return "element_not_found"
+        if "navigation" in msg:
+            return "navigation_error"
+        return "unknown"
