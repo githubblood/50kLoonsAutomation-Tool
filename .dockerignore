@@ -1,0 +1,21 @@
+# Files excluded from the Docker build context
+# (sensitive data and generated artefacts are volume-mounted instead)
+
+.git
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets — mounted as volumes at runtime
+.env
+credentials/
+
+# Generated at runtime — mounted as volumes
+logs/
+screenshots/
+
+# Dev tooling
+diagnose_50k.py
+*.md
+.DS_Store

@@ -89,10 +89,10 @@ class ProxyManager:
     def _load_rotating(self) -> None:
         """Use rotating-gateway endpoint(s).
 
-        For ROTATING_PROXY_MOBILE_URL, builds five carrier-targeted variants
-        (one per entry in _FROXY_CARRIER_MAP) so each call to next_proxy()
-        cycles through a different carrier's IP pool, making the outbound IP's
-        ISP change on every row rather than always resolving to T-Mobile USA.
+        Loads WiFi and/or mobile URLs as-is.  Froxy rotates the exit IP
+        automatically on every connection — no carrier injection needed
+        (injecting carrier codes breaks HTTPS CONNECT tunnelling for most
+        account types).
         """
         force_type = os.getenv("ROTATING_PROXY_FORCE_TYPE", "").strip().lower()
         allowed_type = force_type if force_type in {"wifi", "mobile"} else ""
@@ -100,14 +100,12 @@ class ProxyManager:
         url = os.getenv("ROTATING_PROXY_URL", "").strip()
         if url and (not allowed_type or f":{allowed_type};" in url):
             self._proxies.append(url)
-            self._proxy_carriers[url] = None  # no carrier targeting for wifi
+            self._proxy_carriers[url] = None
 
         mobile_url = os.getenv("ROTATING_PROXY_MOBILE_URL", "").strip()
         if mobile_url and (not allowed_type or f":{allowed_type};" in mobile_url):
-            for carrier_name, froxy_code in _FROXY_CARRIER_MAP.items():
-                carrier_url = self._inject_carrier(mobile_url, froxy_code)
-                self._proxies.append(carrier_url)
-                self._proxy_carriers[carrier_url] = carrier_name
+            self._proxies.append(mobile_url)
+            self._proxy_carriers[mobile_url] = None
 
         if allowed_type:
             log.info("proxy.rotating_force_type", force_type=allowed_type, count=len(self._proxies))

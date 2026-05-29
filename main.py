@@ -8,7 +8,9 @@ fingerprint per row, fills a web form, and writes results back.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
+import signal
 import socket
 import sys
 import time
@@ -40,6 +42,18 @@ load_dotenv()  # Load .env into os.environ
 
 console = Console()
 
+# ── Graceful shutdown ────────────────────────────────────────────────
+# Set by SIGTERM handler; main loop checks this flag between rows so the
+# current row always completes and its status is written before we exit.
+_stop_flag: list[bool] = [False]
+
+
+def _on_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
+    _stop_flag[0] = True
+
+
+signal.signal(signal.SIGTERM, _on_sigterm)
+
 
 def _get_outbound_ip(proxy_url: str | None) -> str:
     """Return the actual outbound IP address, routing through proxy if supplied."""
@@ -61,27 +75,48 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def setup_logging(config: dict) -> None:
-    """Configure structlog with rich console + optional file output."""
+    """Configure structlog → stdlib bridge writing to console + rotating file."""
     log_cfg = config.get("logging", {})
     level = log_cfg.get("level", os.getenv("LOG_LEVEL", "INFO"))
-
-    # Ensure log directory exists
     log_file = log_cfg.get("log_file", "logs/automation.log")
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    level_num = getattr(logging, level.upper(), logging.INFO)
 
-    processors = [
+    shared_processors = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
-        structlog.dev.ConsoleRenderer(),
     ]
 
-    level_num = getattr(logging, level.upper(), logging.INFO)
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.dev.ConsoleRenderer(),
+        ],
+    )
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    file_handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(level_num)
+    root.addHandler(console_handler)
+    root.addHandler(file_handler)
+
     structlog.configure(
-        processors=processors,
-        wrapper_class=structlog.make_filtering_bound_logger(level_num),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
+        processors=[
+            *shared_processors,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
     )
 
 
@@ -128,6 +163,10 @@ def main() -> None:
     stats = {"success": 0, "failed": 0, "retry": 0, "duplicate": 0}
 
     for row in tqdm(pending, desc="Processing rows", unit="row"):
+        if _stop_flag[0]:
+            log.warning("main.stop_requested", msg="SIGTERM received — stopping cleanly")
+            break
+
         row_num = row["_row_number"]
         log.info("row.start", row=row_num)
 

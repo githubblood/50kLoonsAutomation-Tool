@@ -90,9 +90,26 @@ def _run_engine(target_url: str) -> None:
         from utils.device_manager import DeviceManager
         from core.form_filler import FormFiller, FormFillerError
 
+        # Forward all INFO+ structlog events (form steps, warnings, etc.) to the UI log queue.
+        def _ui_log_renderer(lgr, method, ev):
+            lvl = ev.get("level", method).upper()[:4]
+            event = str(ev.get("event", ""))
+            _skip = {"level", "event", "_record", "timestamp", "_logger"}
+
+            def _fv(v):
+                s = str(v).replace('"', "'")
+                return f'"{s}"' if " " in s else s
+
+            parts = [f"{k}={_fv(v)}" for k, v in ev.items()
+                     if k not in _skip and not k.startswith("_")][:5]
+            _log(f"{lvl}  {event}" + ("  " + "  ".join(parts) if parts else ""))
+            raise structlog.DropEvent()
+
         structlog.configure(
-            wrapper_class=structlog.make_filtering_bound_logger(40),
+            processors=[_ui_log_renderer],
+            wrapper_class=structlog.make_filtering_bound_logger(20),
             logger_factory=structlog.PrintLoggerFactory(file=open(os.devnull, "w")),
+            cache_logger_on_first_use=False,
         )
 
         with open("config.yaml") as fh:
@@ -627,7 +644,13 @@ function fetchSs() {
 function startSSE() {
   if (evtSrc) evtSrc.close();
   evtSrc = new EventSource('/logs');
-  evtSrc.onmessage = e => { if (e.data && e.data.trim()) appendLog(e.data); };
+  evtSrc.onmessage = e => {
+    if (!e.data || !e.data.trim()) return;
+    appendLog(e.data);
+    // Update live step label from form.step events
+    const m = e.data.match(/form\.step.*?step=(\d+).*?title="([^"]+)"/);
+    if (m) document.getElementById('step-lbl').textContent = `Step ${m[1]} of 26: ${m[2]}`;
+  };
   evtSrc.onerror   = () => setTimeout(startSSE, 2000);
 }
 
@@ -642,6 +665,7 @@ function startPoll() {
       if (!d.running) {
         clearInterval(pollTmr); pollTmr = null;
         stopSsPoll();
+        document.getElementById('step-lbl').textContent = '';
       }
     } catch (_) {}
   }, 1500);

@@ -1,0 +1,40 @@
+[Unit]
+Description=Lead Automation Engine
+Documentation=https://github.com/your-org/lead-automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=automation
+Group=automation
+WorkingDirectory=/opt/lead-automation
+
+# Source the venv and run the loop script
+ExecStart=/opt/lead-automation/run.sh
+
+# Allow the current row to finish before hard-killing (match stop_grace in Docker)
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Restart policy — back-off to avoid rapid restart loops on permanent errors
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging goes to the systemd journal; view with:
+#   journalctl -u lead-automation -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lead-automation
+
+# Ensure dirs exist before starting
+ExecStartPre=/bin/mkdir -p /opt/lead-automation/logs /opt/lead-automation/screenshots
+
+[Install]
+WantedBy=multi-user.target

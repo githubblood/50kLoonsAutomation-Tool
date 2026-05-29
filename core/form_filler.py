@@ -177,7 +177,13 @@ class FormFiller:
                 raise FormFillerError("Stopped by user", error_type="stopped")
             try:
                 title = self._get_title(frame).lower().strip()
-            except Exception:
+            except Exception as _te:
+                _te_msg = str(_te).lower()
+                if "closed" in _te_msg or "target page" in _te_msg or "browser has been" in _te_msg:
+                    raise FormFillerError(
+                        f"Browser closed unexpectedly at step {step_num}",
+                        error_type="browser_closed",
+                    ) from _te
                 title = ""
 
             # Reached a completion / offer page
@@ -237,6 +243,11 @@ class FormFiller:
             # ── End duplicate detection ─────────────────────────────────────
 
             log.info("form.step", step=step_num, title=title[:60], row=row_number)
+            # Update live preview BEFORE filling the step so the UI shows the active step
+            try:
+                page.screenshot(path=str(self._ss_dir / "live_view.png"))
+            except Exception:
+                pass
 
             result = self._handle_step(frame, title, f)
             if not result:
@@ -364,6 +375,7 @@ class FormFiller:
         btn = None
         deadline = time.time() + 150  # generous cap — click as soon as visible
         elapsed_log = 0
+        _last_ss = 0.0
         while time.time() < deadline:
             btn = _find_btn()
             if btn:
@@ -373,7 +385,15 @@ class FormFiller:
                 log.info("form.offer_received_ticked", row=row_number)
                 btn = _find_btn()
                 break
-            now = int(time.time() - (deadline - 150))
+            now_t = time.time()
+            # Keep live preview updated every 4 s during the post-submit wait
+            if now_t - _last_ss >= 4:
+                try:
+                    page.screenshot(path=str(self._ss_dir / "live_view.png"))
+                    _last_ss = now_t
+                except Exception:
+                    pass
+            now = int(now_t - (deadline - 150))
             if now - elapsed_log >= 15:
                 log.info("form.offers_processing", elapsed_s=now, row=row_number)
                 elapsed_log = now
@@ -637,7 +657,18 @@ class FormFiller:
             except Exception:
                 pass
             time.sleep(1)
-            return self._continue(frame)
+            result = self._continue(frame)
+            if not result:
+                try:
+                    for btn in frame.locator("button").all():
+                        t = (btn.text_content() or "").strip().upper()
+                        if any(kw in t for kw in ["CONTINUE", "NEXT", "SUBMIT"]):
+                            btn.click(force=True, timeout=3000)
+                            result = "FORCED"
+                            break
+                except Exception:
+                    pass
+            return result or "DL_FILLED"
         # ── Unsecured debt question ────────────────────────────────────────────
         if "debt" in title or "unsecured" in title:
             return self._chip(frame, "No")

@@ -88,7 +88,8 @@ class SheetHandler:
         pending: list[dict[str, Any]] = []
 
         for idx, record in enumerate(all_records, start=2):  # row 1 = header
-            if str(record.get(status_col, "")).strip().lower() == "pending":
+            val = str(record.get(status_col, "")).strip().lower()
+            if val in ("pending", ""):
                 record["_row_number"] = idx
                 pending.append(record)
 

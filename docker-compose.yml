@@ -1,0 +1,80 @@
+# ── Lead Automation — Docker Compose (production) ────────────────────
+#
+# Quick start:
+#   cp .env.example .env          # fill in your values
+#   cp credentials.json credentials/credentials.json
+#   docker compose up -d
+#
+# View logs:
+#   docker compose logs -f automation
+#
+# Stop gracefully (lets the current row finish):
+#   docker compose stop           # sends SIGTERM, waits up to 60 s
+
+services:
+
+  # ── Core automation engine ─────────────────────────────────────────
+  automation:
+    build: .
+    container_name: lead-automation
+    restart: unless-stopped
+
+    # Use run.sh so the engine loops automatically between runs
+    command: ["bash", "run.sh"]
+
+    env_file: .env
+    environment:
+      HEADLESS: "true"      # must be headless inside the container
+
+    volumes:
+      # Secrets — read-only inside the container
+      - ./credentials:/app/credentials:ro
+      # Persistent artefacts — writable
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+
+    # Give the current row time to complete before hard-killing
+    stop_grace_period: 120s
+
+    # Basic liveness check — fails if the process is not alive
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "main.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── Optional web UI ────────────────────────────────────────────────
+  webui:
+    build: .
+    container_name: lead-automation-ui
+    restart: unless-stopped
+    command: ["python", "app.py"]
+
+    env_file: .env
+    environment:
+      HEADLESS: "true"
+
+    ports:
+      - "5000:5000"
+
+    volumes:
+      - ./credentials:/app/credentials:ro
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+
+    # webui just reads state; let automation start first
+    depends_on:
+      - automation
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
