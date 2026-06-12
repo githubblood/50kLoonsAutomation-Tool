@@ -1,9 +1,10 @@
 """
-app.py — Lead Automation Web UI
-────────────────────────────────
-Flask server that lets the user pick an offer, then start/stop the engine.
-Run with:  python app.py
-Then open: http://localhost:5000
+app.py — Multi-Site Lead Automation Web UI
+──────────────────────────────────────────
+Run up to 4 offers simultaneously. Each offer has its own engine thread,
+log queue, stats, screenshot directory, and stop event.
+
+Open: http://localhost:5000
 """
 from __future__ import annotations
 
@@ -13,13 +14,14 @@ import socket
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests as _requests
 import yaml
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from flask import Flask, Response, jsonify, make_response, render_template_string, request
 
 import urllib3.util.connection as _urllib3_cn
 _urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
@@ -28,43 +30,78 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# ── Offers ────────────────────────────────────────────────────────────────────
-
+# ── Offers registry ───────────────────────────────────────────────────────────
 OFFERS: dict[str, dict] = {
-    "low_credit":     {"name": "Low Credit Finance",    "url": "https://lowcreditfinance.com"},
-    "50k_loans":      {"name": "50k Loans",             "url": "https://spaxads.gotrackier.com/click?campaign_id=1128&pub_id=2"},
-    "super_personal": {"name": "Super Personal Finder", "url": "https://superpersonalfinder.com"},
-    "borrow_money":   {"name": "BorrowMoney",           "url": "https://borrowmoney.us"},
+    "50k_loans": {
+        "name":          "50k Loans",
+        "url":           "https://50kloans.com/",
+        "filler":        "core.form_filler",
+        "color":         "#38bdf8",
+        "sheet_url_env": "SHEET_URL_50K",
+        "sheet_ws_env":  "SHEET_WS_50K",
+    },
+    "low_credit": {
+        "name":          "Low Credit Finance",
+        "url":           "https://lowcreditfinance.com",
+        "filler":        "core.form_filler_lowcredit",
+        "color":         "#4ade80",
+        "sheet_url_env": "SHEET_URL_LOW_CREDIT",
+        "sheet_ws_env":  "SHEET_WS_LOW_CREDIT",
+    },
+    "borrow_money": {
+        "name":          "BorrowMoney",
+        "url":           "https://borrowmoney.us",
+        "filler":        "core.form_filler_borrowmoney",
+        "color":         "#fb923c",
+        "sheet_url_env": "SHEET_URL_BORROW_MONEY",
+        "sheet_ws_env":  "SHEET_WS_BORROW_MONEY",
+    },
+    "super_personal": {
+        "name":          "Super Personal Finder",
+        "url":           "https://superpersonalfinder.com",
+        "filler":        "core.form_filler_superpersonal",
+        "color":         "#c084fc",
+        "sheet_url_env": "SHEET_URL_SUPER_PERSONAL",
+        "sheet_ws_env":  "SHEET_WS_SUPER_PERSONAL",
+    },
 }
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+# ── Per-engine state ──────────────────────────────────────────────────────────
 
-_state: dict = {
-    "running":       False,
-    "stop_event":    threading.Event(),
-    "thread":        None,
-    "log_queue":     queue.Queue(maxsize=1000),
-    "stats":         {"success": 0, "failed": 0, "duplicate": 0, "total": 0, "processed": 0},
-    "selected_offer":"50k_loans",
-}
+def _mk_engine() -> dict:
+    return {
+        "running":    False,
+        "stop_event": threading.Event(),
+        "thread":     None,
+        "log_queue":  queue.Queue(maxsize=1000),
+        "stats":      {"fresh": 0, "duplicate": 0, "total": 0, "processed": 0},
+    }
 
-_SS_PATH = Path("screenshots/live_view.png")   # written by form_filler, read by /screenshot
+_engines: dict[str, dict] = {oid: _mk_engine() for oid in OFFERS}
+
+# Thread-local: each engine thread stores its offer_id so the global
+# structlog processor routes log lines to the right queue.
+_tl = threading.local()
 
 
-def _log(msg: str) -> None:
-    """Push each line of msg as a separate queue entry so SSE newlines never break."""
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _ss_path(offer_id: str) -> Path:
+    return Path(f"screenshots/{offer_id}/live_view.png")
+
+
+def _log(offer_id: str, msg: str) -> None:
+    q = _engines[offer_id]["log_queue"]
     ts = time.strftime("%H:%M:%S")
     for part in str(msg).splitlines() or [""]:
         entry = f"[{ts}] {part}"
-        if _state["log_queue"].full():
+        if q.full():
             try:
-                _state["log_queue"].get_nowait()
+                q.get_nowait()
             except queue.Empty:
                 pass
-        _state["log_queue"].put_nowait(entry)
+        q.put_nowait(entry)
 
-
-# ── Automation engine ─────────────────────────────────────────────────────────
 
 def _get_outbound_ip(proxy_url: str | None) -> str:
     try:
@@ -78,20 +115,14 @@ def _get_outbound_ip(proxy_url: str | None) -> str:
         return "direct"
 
 
-def _run_engine(target_url: str) -> None:
-    stop_event = _state["stop_event"]
-    _state["running"] = True
-    _state["stats"] = {"success": 0, "failed": 0, "duplicate": 0, "total": 0, "processed": 0}
+# ── Structlog global config ───────────────────────────────────────────────────
 
-    try:
-        import structlog
-        from utils.sheet_handler import SheetHandler
-        from utils.proxy_manager import ProxyManager
-        from utils.device_manager import DeviceManager
-        from core.form_filler import FormFiller, FormFillerError
+def _setup_structlog() -> None:
+    import structlog
 
-        # Forward all INFO+ structlog events (form steps, warnings, etc.) to the UI log queue.
-        def _ui_log_renderer(lgr, method, ev):
+    def _routing_renderer(lgr, method, ev):
+        offer_id = getattr(_tl, "offer_id", None)
+        if offer_id:
             lvl = ev.get("level", method).upper()[:4]
             event = str(ev.get("event", ""))
             _skip = {"level", "event", "_record", "timestamp", "_logger"}
@@ -100,178 +131,162 @@ def _run_engine(target_url: str) -> None:
                 s = str(v).replace('"', "'")
                 return f'"{s}"' if " " in s else s
 
-            parts = [f"{k}={_fv(v)}" for k, v in ev.items()
-                     if k not in _skip and not k.startswith("_")][:5]
-            _log(f"{lvl}  {event}" + ("  " + "  ".join(parts) if parts else ""))
-            raise structlog.DropEvent()
+            parts = [
+                f"{k}={_fv(v)}"
+                for k, v in ev.items()
+                if k not in _skip and not k.startswith("_")
+            ][:5]
+            _log(offer_id, f"{lvl}  {event}" + ("  " + "  ".join(parts) if parts else ""))
+        raise structlog.DropEvent()
 
-        structlog.configure(
-            processors=[_ui_log_renderer],
-            wrapper_class=structlog.make_filtering_bound_logger(20),
-            logger_factory=structlog.PrintLoggerFactory(file=open(os.devnull, "w")),
-            cache_logger_on_first_use=False,
-        )
+    structlog.configure(
+        processors=[_routing_renderer],
+        wrapper_class=structlog.make_filtering_bound_logger(20),
+        logger_factory=structlog.PrintLoggerFactory(file=open(os.devnull, "w")),
+        cache_logger_on_first_use=False,
+    )
 
+
+# ── Engine runner ─────────────────────────────────────────────────────────────
+
+def _run_engine(offer_id: str, target_url: str = "") -> None:  # noqa: ARG001 — url kept for API compat
+    eng = _engines[offer_id]
+    stop_event = eng["stop_event"]
+    eng["running"] = True
+    eng["stats"] = {"fresh": 0, "duplicate": 0, "total": 0, "processed": 0}
+    _tl.offer_id = offer_id
+
+    try:
+        import importlib
         with open("config.yaml") as fh:
             config = yaml.safe_load(fh)
-        config["target"]["url"] = target_url
-        _log(f"INFO  Target → {target_url}")
 
-        _log("INFO  Connecting to Google Sheets…")
-        sheet = SheetHandler(config)
-        proxy_mgr = ProxyManager()
-        device_mgr = DeviceManager(config)
-        form_filler = FormFiller(config)
+        # Per-offer sheet override (optional).
+        # NOTE: resolved into locals and passed explicitly to SheetHandler.
+        # Do NOT mutate os.environ here — engines run as concurrent threads in
+        # one process, so global env vars would race and an engine could load
+        # another offer's worksheet (causing fresh leads to be miscategorised).
+        offer_cfg = OFFERS[offer_id]
+        url_env = offer_cfg.get("sheet_url_env", "")
+        ws_env  = offer_cfg.get("sheet_ws_env",  "")
+        sheet_url      = os.getenv(url_env) or os.getenv("GOOGLE_SHEET_URL", "")
+        worksheet_name = os.getenv(ws_env)  or os.getenv("GOOGLE_SHEET_WORKSHEET", "Sheet1")
 
-        if proxy_mgr.has_proxies:
-            _log(f"INFO  Proxy pool: {proxy_mgr.total} proxy/proxies loaded")
-        else:
-            _log("WARN  No proxies — running direct")
+        _log(offer_id, f"INFO  Offer: {OFFERS[offer_id]['name']}")
+        _log(offer_id, "INFO  Mode: website classify (Duplicate / Fresh via email + SSN on site)")
+        _log(offer_id, f"INFO  Connecting to Google Sheets (worksheet: {worksheet_name})...")
+
+        from utils.sheet_handler import SheetHandler
+        from core.exceptions import FormFillerError
+
+        sheet = SheetHandler(config, worksheet_name=worksheet_name, sheet_url=sheet_url)
+        direct_ip = _get_outbound_ip(None)
+
+        # Load the form filler for this offer
+        filler_mod = offer_cfg.get("filler", "core.form_filler")
+        site_url   = offer_cfg.get("url", "")
+        mod = importlib.import_module(filler_mod)
+        offer_config = dict(config)
+        offer_config["target"] = {**config.get("target", {}), "url": site_url}
+        from pathlib import Path as _Path
+        ss_dir = _Path(f"screenshots/{offer_id}")
+        ss_dir.mkdir(parents=True, exist_ok=True)
+        offer_config.setdefault("screenshots", {})["directory"] = str(ss_dir)
 
         pending = sheet.get_pending_rows()
         if not pending:
-            _log("WARN  No pending rows found. Nothing to do.")
+            _log(offer_id, "WARN  No pending rows found. Nothing to do.")
             return
 
-        _state["stats"]["total"] = len(pending)
-        _log(f"INFO  {len(pending)} pending row(s) to process")
+        eng["stats"]["total"] = len(pending)
+        max_concurrent = int(os.getenv("MAX_CONCURRENT_ROWS", "5"))
+        _log(offer_id, f"INFO  {len(pending)} pending row(s) — {max_concurrent} concurrent workers — no proxy — single device")
 
-        retry_cfg = config.get("retry", {})
-        max_retries = retry_cfg.get("max_retries", 3)
-        backoff_base = retry_cfg.get("backoff_base", 2)
-        backoff_max = retry_cfg.get("backoff_max", 30)
+        stats_lock = threading.Lock()
 
-        for row in pending:
+        def _process_one(row: dict) -> None:
+            _tl.offer_id = offer_id  # thread-local so logging routes correctly
             if stop_event.is_set():
-                _log("INFO  Stop signal received — halting.")
-                break
-
+                return
             row_num = row["_row_number"]
-            _log(f"INFO  ── Row {row_num} ──────────────────────")
-            sheet.mark_in_progress(row_num)
+            _log(offer_id, f"INFO  -- Row {row_num} --")
 
-            rc_col = config.get("sheet_columns", {}).get("retry_count", "Retry_Count")
-            retry_count = int(row.get(rc_col, 0) or 0)
-            attempt = 0
-            success = False
+            # Each thread needs its own FormFiller — _classify_only is instance state
+            thread_filler = mod.FormFiller(offer_config)
+            status = "Failed"
+            notes  = ""
+            try:
+                result = thread_filler.classify_lead_on_site(
+                    row=row,
+                    proxy_url=None,
+                    row_number=row_num,
+                    stop_event=stop_event,
+                )
+                status = result.get("status", "Fresh")
+                notes  = result.get("notes", "")
+            except FormFillerError as exc:
+                if exc.error_type == "duplicate":
+                    status = "Duplicate"
+                    notes  = str(exc)
+                else:
+                    status = "Failed"
+                    notes  = f"[{exc.error_type}] {exc}"
+                    _log(offer_id, f"ERR   Row {row_num} classify failed ({exc.error_type}): {exc}")
 
-            while attempt <= max_retries and not success:
+            sheet.update_row(
+                row_num,
+                status=status,
+                notes=notes,
+                proxy_used="direct",
+                ip=direct_ip,
+            )
+
+            with stats_lock:
+                eng["stats"]["processed"] += 1
+                if status == "Duplicate":
+                    eng["stats"]["duplicate"] += 1
+                    _log(offer_id, f"WARN  Row {row_num} -> Duplicate (website)")
+                elif status == "Fresh":
+                    eng["stats"]["fresh"] += 1
+                    _log(offer_id, f"OK    Row {row_num} -> Fresh (website)")
+                else:
+                    _log(offer_id, f"ERR   Row {row_num} -> {status}")
+
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            futures = {
+                executor.submit(_process_one, row): row["_row_number"]
+                for row in pending
+            }
+            for future in as_completed(futures):
                 if stop_event.is_set():
+                    _log(offer_id, "INFO  Stop signal received -- halting.")
+                    # cancel queued futures that haven't started yet
+                    for f in futures:
+                        f.cancel()
                     break
-
-                proxy_url = proxy_mgr.next_proxy()
-                fingerprint = device_mgr.build_fingerprint(row)
-                # Override JS carrier to match the actual proxy IP carrier
-                if proxy_mgr.current_carrier:
-                    fingerprint["_carrier"] = proxy_mgr.current_carrier
-                carrier = fingerprint.get("_carrier", "unknown")
-                proxy_display = proxy_url or "direct"
-                proxy_type = ProxyManager.proxy_type(proxy_url)
-                proxy_ip = _get_outbound_ip(proxy_url)
-
-                _log(f"INFO  Row {row_num} attempt {attempt+1}/{max_retries+1} | proxy: {proxy_type} ({proxy_ip}) | carrier: {carrier}")
-
                 try:
-                    result = form_filler.process_row(
-                        row=row,
-                        fingerprint=fingerprint,
-                        proxy_url=proxy_url,
-                        row_number=row_num,
-                        stop_event=stop_event,     # ← passed so the filler can abort mid-step
-                    )
-                    sheet.update_row(
-                        row_num, status="Success",
-                        notes=result.get("notes", ""),
-                        proxy_used=proxy_display, ip=proxy_ip,
-                        submission_id=result.get("submission_id", ""),
-                        retry_count=retry_count + attempt,
-                    )
-                    _state["stats"]["success"] += 1
-                    _state["stats"]["processed"] += 1
-                    success = True
-                    _log(f"OK    Row {row_num} → Success ✓")
+                    future.result()
+                except Exception as exc:
+                    row_num = futures[future]
+                    _log(offer_id, f"ERR   Row {row_num} worker crashed: {exc!r}")
 
-                except FormFillerError as e:
-                    # ── User pressed Stop mid-fill ──
-                    if e.error_type == "stopped":
-                        sheet.update_row(row_num, status="Stopped",
-                                         notes="[stopped] Run stopped by user",
-                                         proxy_used=proxy_display, ip=proxy_ip,
-                                         retry_count=retry_count + attempt)
-                        _log(f"INFO  Row {row_num} → marked Stopped")
-                        success = True   # prevents retry loop; outer loop will also break
-                        break
-
-                    if e.error_type == "duplicate":
-                        sheet.update_row(row_num, status="Duplicate",
-                                         notes=f"[duplicate] {e}",
-                                         proxy_used=proxy_display, ip=proxy_ip,
-                                         retry_count=retry_count + attempt)
-                        _state["stats"]["duplicate"] += 1
-                        _state["stats"]["processed"] += 1
-                        success = True
-                        _log(f"WARN  Row {row_num} → Duplicate")
-                        break
-
-                    if e.error_type == "missing_data":
-                        sheet.update_row(row_num, status="Failed",
-                                         notes=f"[missing_data] {e}",
-                                         proxy_used=proxy_display, ip=proxy_ip,
-                                         retry_count=retry_count + attempt)
-                        _state["stats"]["failed"] += 1
-                        _state["stats"]["processed"] += 1
-                        success = True
-                        _log(f"ERR   Row {row_num} → Failed (missing data)")
-                        break
-
-                    attempt += 1
-                    if attempt > max_retries:
-                        sheet.update_row(row_num, status="Failed",
-                                         notes=f"[{e.error_type}] {e} (after {attempt} attempts)",
-                                         proxy_used=proxy_display, ip=proxy_ip,
-                                         retry_count=retry_count + attempt)
-                        _state["stats"]["failed"] += 1
-                        _state["stats"]["processed"] += 1
-                        _log(f"ERR   Row {row_num} → Failed after {attempt} attempts ({e.error_type})")
-                    else:
-                        delay = min(backoff_base ** attempt, backoff_max)
-                        sheet.update_row(row_num, status="Retry",
-                                         notes=f"[{e.error_type}] retrying in {delay}s",
-                                         proxy_used=proxy_display, ip=proxy_ip,
-                                         retry_count=retry_count + attempt)
-                        _log(f"RETRY Row {row_num} — waiting {delay}s before next attempt")
-                        for _ in range(int(delay)):
-                            if stop_event.is_set():
-                                break
-                            time.sleep(1)
-
-                except Exception as e:
-                    sheet.update_row(row_num, status="Failed",
-                                     notes=f"[unexpected] {e}",
-                                     proxy_used=proxy_display, ip=proxy_ip,
-                                     retry_count=retry_count + attempt)
-                    _state["stats"]["failed"] += 1
-                    _state["stats"]["processed"] += 1
-                    _log(f"ERR   Row {row_num} → Unexpected error: {e}")
-                    break
-
-        s = _state["stats"]
-        _log(
-            f"DONE  Run complete — "
-            f"Success: {s['success']}  Duplicate: {s['duplicate']}  "
-            f"Failed: {s['failed']}  Processed: {s['processed']}/{s['total']}"
-        )
+        s = eng["stats"]
+        _log(offer_id,
+             f"DONE  Run complete -- Fresh: {s['fresh']}  "
+             f"Duplicate: {s['duplicate']}  "
+             f"Processed: {s['processed']}/{s['total']}")
 
     except Exception as e:
-        _log(f"FATAL Engine crashed: {type(e).__name__}: {e!r}")
-        _log(traceback.format_exc())
+        _log(offer_id, f"FATAL Engine crashed: {type(e).__name__}: {e!r}")
+        _log(offer_id, traceback.format_exc())
     finally:
-        _state["running"] = False
+        eng["running"] = False
+        _tl.offer_id   = None
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 
-_HTML = """<!DOCTYPE html>
+_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -279,154 +294,96 @@ _HTML = """<!DOCTYPE html>
 <title>Lead Automation Engine</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
 body {
   font-family: 'Segoe UI', system-ui, sans-serif;
-  background: #0b0e18;
-  color: #e2e8f0;
-  min-height: 100vh;
-  padding: 22px 14px 44px;
+  background: #0b0e18; color: #e2e8f0;
+  min-height: 100vh; padding: 22px 14px 50px;
 }
-
-.wrap { max-width: 960px; margin: 0 auto; }
-
-h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; letter-spacing: -.5px; }
-.subtitle { font-size: .8rem; color: #4b5563; margin: 3px 0 22px; }
-
-/* ── Cards ── */
+.wrap { max-width: 1080px; margin: 0 auto; }
+.header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  margin-bottom: 22px; flex-wrap: wrap; gap: 12px;
+}
+h1 { font-size: 1.45rem; font-weight: 700; color: #7dd3fc; letter-spacing: -.5px; }
+.subtitle { font-size: .78rem; color: #4b5563; margin-top: 3px; }
+.stop-all {
+  padding: 9px 20px; background: #7f1d1d; color: #fca5a5;
+  border: 1px solid #b91c1c; border-radius: 8px;
+  font-size: .82rem; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.stop-all:hover { background: #991b1b; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
 .card {
-  background: #131926;
-  border: 1px solid #1e2d40;
-  border-radius: 12px;
-  padding: 18px 20px;
-  margin-bottom: 14px;
+  background: #131926; border: 2px solid #1e2d40;
+  border-radius: 12px; overflow: hidden;
+  display: flex; flex-direction: column; transition: border-color .2s;
 }
-.card-title {
-  font-size: .68rem; font-weight: 700;
-  text-transform: uppercase; letter-spacing: 1px;
-  color: #38bdf8; margin-bottom: 13px;
+.card.is-running  { border-color: #166534; }
+.card.is-stopping { border-color: #7c2d12; }
+.card-head { padding: 14px 16px 12px; }
+.name-row {
   display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 4px;
 }
-
-/* ── Offers ── */
-.offers-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-@media (max-width: 480px) { .offers-grid { grid-template-columns: 1fr; } }
-
-.offer-label {
-  display: flex; align-items: flex-start; gap: 10px;
-  padding: 11px 13px;
-  border: 2px solid #1e2d40; border-radius: 9px;
-  cursor: pointer; transition: border-color .15s, background .15s;
+.offer-name { font-size: .95rem; font-weight: 700; }
+.offer-url {
+  font-size: .61rem; color: #374151; word-break: break-all;
+  margin-bottom: 11px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
 }
-.offer-label:hover { border-color: #3b82f6; background: #111827; }
-.offer-label.selected { border-color: #38bdf8; background: #0d1f2d; }
-.offer-label input[type=radio] { display: none; }
-
-.offer-dot {
-  width: 15px; height: 15px; border: 2px solid #374151; border-radius: 50%;
-  flex-shrink: 0; margin-top: 3px; position: relative; transition: border-color .15s;
-}
-.offer-label.selected .offer-dot { border-color: #38bdf8; }
-.offer-label.selected .offer-dot::after {
-  content: ''; position: absolute; inset: 3px;
-  background: #38bdf8; border-radius: 50%;
-}
-.offer-name { font-size: .86rem; font-weight: 600; }
-.offer-url  { font-size: .66rem; color: #4b5563; word-break: break-all; margin-top: 2px; }
-
-/* ── Two-column layout ── */
-.two-col {
-  display: grid;
-  grid-template-columns: 1fr 270px;
-  gap: 14px;
-  align-items: start;
-}
-@media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
-.left-col { display: flex; flex-direction: column; gap: 14px; }
-
-/* ── Controls ── */
-.status-row { display: flex; align-items: center; gap: 8px; margin-bottom: 13px; font-size: .84rem; }
 .badge {
   padding: 3px 10px; border-radius: 20px;
-  font-size: .68rem; font-weight: 700; letter-spacing: .5px;
+  font-size: .64rem; font-weight: 700; letter-spacing: .5px; white-space: nowrap;
 }
-.badge.idle    { background: #1a2d47; color: #60a5fa; }
-.badge.running { background: #14532d; color: #4ade80; animation: pulse 1.4s infinite; }
+.badge.idle     { background: #1a2d47; color: #60a5fa; }
+.badge.running  { background: #14532d; color: #4ade80; animation: pulse 1.4s infinite; }
 .badge.stopping { background: #431407; color: #fb923c; animation: pulse 1s infinite; }
-@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
-
-.controls { display: flex; gap: 10px; }
-button {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 10px 22px; font-size: .84rem; font-weight: 600;
-  border: none; border-radius: 8px; cursor: pointer;
-  transition: opacity .15s, transform .1s;
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.5} }
+.ctrls { display: flex; gap: 8px; margin-bottom: 11px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 7px 15px; font-size: .78rem; font-weight: 600;
+  border: none; border-radius: 7px; cursor: pointer; transition: opacity .15s;
 }
-button:active:not(:disabled) { transform: scale(.97); }
-button:disabled { opacity: .35; cursor: not-allowed; }
-#btn-start { background: #16a34a; color: #f0fdf4; }
-#btn-start:hover:not(:disabled) { background: #22c55e; }
-#btn-stop  { background: #dc2626; color: #fff; }
-#btn-stop:hover:not(:disabled)  { background: #ef4444; }
-
-/* ── Stats ── */
-.stats-row { display: flex; gap: 8px; flex-wrap: wrap; }
-.stat-box {
-  flex: 1; min-width: 66px;
-  background: #0d1117; border: 1px solid #1e2d40;
-  border-radius: 8px; padding: 9px 10px; text-align: center;
+.btn:disabled { opacity: .3; cursor: not-allowed; }
+.btn-start { background: #16a34a; color: #f0fdf4; }
+.btn-start:hover:not(:disabled) { background: #22c55e; }
+.btn-stop  { background: #dc2626; color: #fff; }
+.btn-stop:hover:not(:disabled)  { background: #ef4444; }
+.stats { display: flex; gap: 5px; }
+.stat {
+  flex: 1; background: #0d1117; border: 1px solid #1e2d40;
+  border-radius: 6px; padding: 6px 4px; text-align: center;
 }
-.stat-value { font-size: 1.45rem; font-weight: 700; line-height: 1.1; }
-.stat-label { font-size: .6rem; color: #4b5563; margin-top: 2px; text-transform: uppercase; letter-spacing: .5px; }
-.sv-ok   .stat-value { color: #4ade80; }
-.sv-dup  .stat-value { color: #facc15; }
-.sv-fail .stat-value { color: #f87171; }
-.sv-tot  .stat-value { color: #7dd3fc; }
-
-/* ── Live browser panel ── */
-.phone-wrap {
-  position: relative;
-  background: #07090f;
-  border: 2px solid #1e2d40;
-  border-radius: 14px;
-  overflow: hidden;
-  min-height: 150px;
+.stat-val { font-size: 1.05rem; font-weight: 700; line-height: 1.1; }
+.stat-lbl {
+  font-size: .52rem; color: #4b5563; margin-top: 2px;
+  text-transform: uppercase; letter-spacing: .5px;
 }
-.phone-notch {
-  position: absolute; top: 0; left: 50%; transform: translateX(-50%);
-  width: 54px; height: 9px;
-  background: #1e2d40; border-radius: 0 0 7px 7px; z-index: 3;
+.sv-ok   .stat-val { color: #4ade80; }
+.sv-dup  .stat-val { color: #facc15; }
+.sv-fail .stat-val { color: #f87171; }
+.sv-tot  .stat-val { color: #7dd3fc; }
+.ss-wrap {
+  position: relative; background: #07090f;
+  border-top: 1px solid #1a2535;
+  min-height: 80px; max-height: 200px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
 }
-#live-img {
-  display: none;
-  width: 100%; height: auto;
-  border-radius: 12px;
+.ss-img { width: 100%; height: auto; display: none; max-height: 200px; object-fit: contain; }
+.ss-ph  { font-size: .68rem; color: #1f2937; }
+.step-lbl {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(7,9,15,.8); text-align: center;
+  font-size: .6rem; color: #60a5fa; padding: 3px 6px;
 }
-#live-ph {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  min-height: 220px; gap: 10px; padding: 20px; text-align: center;
-}
-.ph-icon { font-size: 2.2rem; opacity: .2; }
-.ph-text { font-size: .74rem; color: #374151; line-height: 1.5; }
-.live-badge {
-  display: none;
-  font-size: .6rem; font-weight: 700; letter-spacing: 1px;
-  color: #4ade80; animation: pulse 1.4s infinite;
-}
-.live-badge.on { display: inline; }
-.step-lbl { font-size: .65rem; color: #374151; text-align: center; margin-top: 7px; min-height: 1em; }
-
-/* ── Log ── */
-#log-box {
-  background: #07090f;
-  border: 1px solid #111827;
-  border-radius: 8px;
-  height: 260px;
-  overflow-y: auto;
-  padding: 11px 13px;
+.mini-log {
+  flex: 1; min-height: 120px; max-height: 160px; overflow-y: auto;
+  padding: 8px 10px;
   font-family: 'JetBrains Mono','Cascadia Code','Fira Code',monospace;
-  font-size: .72rem;
-  line-height: 1.7;
+  font-size: .66rem; line-height: 1.65;
+  border-top: 1px solid #1a2535; background: #07090f;
 }
 .ll   { white-space: pre-wrap; word-break: break-all; }
 .ok   { color: #4ade80; }
@@ -437,130 +394,82 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .ftl  { color: #f43f5e; font-weight: 700; }
 .inf  { color: #64748b; }
 .muted{ color: #1f2937; font-style: italic; }
-.clr-btn {
-  padding: 3px 9px !important; font-size: .65rem !important;
-  background: #1a2535 !important; color: #64748b !important;
-  border-radius: 6px !important;
-}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Lead Automation Engine</h1>
-  <p class="subtitle">Select an offer, then press Start to submit leads from Google Sheets.</p>
-
-  <!-- Offer selection -->
-  <div class="card">
-    <div class="card-title">Select Offer</div>
-    <div class="offers-grid">
-      {% for key, offer in offers.items() %}
-      <label class="offer-label{% if key == '50k_loans' %} selected{% endif %}"
-             id="lbl-{{ key }}" onclick="pickOffer('{{ key }}')">
-        <input type="radio" name="offer" value="{{ key }}"{% if key == '50k_loans' %} checked{% endif %}/>
-        <div class="offer-dot"></div>
-        <div>
-          <div class="offer-name">{{ offer.name }}</div>
-          <div class="offer-url">{{ offer.url }}</div>
-        </div>
-      </label>
-      {% endfor %}
+  <div class="header">
+    <div>
+      <h1>Lead Automation Engine</h1>
+      <p class="subtitle">Run multiple offers simultaneously — each card is fully independent.</p>
     </div>
+    <button class="stop-all" onclick="stopAll()">&#9632; Stop All Running</button>
   </div>
 
-  <!-- Two-column section -->
-  <div class="two-col">
-
-    <!-- Left: controls + stats -->
-    <div class="left-col">
-      <div class="card" style="margin:0">
-        <div class="card-title">Engine Controls</div>
-        <div class="status-row">
-          Status:&nbsp;
-          <span class="badge idle" id="badge">IDLE</span>
-          <span id="status-sub" style="font-size:.76rem;color:#374151;margin-left:4px;"></span>
+  <div class="grid">
+    {% for key, offer in offers.items() %}
+    <div class="card" id="card-{{ key }}">
+      <div class="card-head">
+        <div class="name-row">
+          <span class="offer-name" style="color:{{ offer.color }}">{{ offer.name }}</span>
+          <span class="badge idle" id="badge-{{ key }}">IDLE</span>
         </div>
-        <div class="controls">
-          <button id="btn-start" onclick="startEngine()">&#9654; Start</button>
-          <button id="btn-stop"  onclick="stopEngine()" disabled>&#9632; Stop</button>
+        <div class="offer-url" title="{{ offer.url }}">{{ offer.url }}</div>
+        <div class="ctrls">
+          <button class="btn btn-start" id="btn-start-{{ key }}"
+                  onclick="startEngine('{{ key }}')">&#9654; Start</button>
+          <button class="btn btn-stop"  id="btn-stop-{{ key }}"
+                  onclick="stopEngine('{{ key }}')" disabled>&#9632; Stop</button>
         </div>
-      </div>
-
-      <div class="card" style="margin:0">
-        <div class="card-title">Statistics</div>
-        <div class="stats-row">
-          <div class="stat-box sv-ok">
-            <div class="stat-value" id="s-ok">0</div>
-            <div class="stat-label">Success</div>
+        <div class="stats">
+          <div class="stat sv-ok">
+            <div class="stat-val" id="s-fresh-{{ key }}">0</div>
+            <div class="stat-lbl">Fresh</div>
           </div>
-          <div class="stat-box sv-dup">
-            <div class="stat-value" id="s-dup">0</div>
-            <div class="stat-label">Duplicate</div>
+          <div class="stat sv-dup">
+            <div class="stat-val" id="s-dup-{{ key }}">0</div>
+            <div class="stat-lbl">Dup</div>
           </div>
-          <div class="stat-box sv-fail">
-            <div class="stat-value" id="s-fail">0</div>
-            <div class="stat-label">Failed</div>
+          <div class="stat sv-tot">
+            <div class="stat-val" id="s-proc-{{ key }}">0</div>
+            <div class="stat-lbl">Done</div>
           </div>
-          <div class="stat-box sv-tot">
-            <div class="stat-value" id="s-proc">0</div>
-            <div class="stat-label">Done</div>
-          </div>
-          <div class="stat-box sv-tot">
-            <div class="stat-value" id="s-tot">0</div>
-            <div class="stat-label">Total</div>
+          <div class="stat sv-tot">
+            <div class="stat-val" id="s-tot-{{ key }}">0</div>
+            <div class="stat-lbl">Total</div>
           </div>
         </div>
       </div>
-    </div>
-
-    <!-- Right: live browser view -->
-    <div class="card" style="margin:0">
-      <div class="card-title">
-        Live Browser View
-        <span class="live-badge" id="live-badge">● LIVE</span>
+      <div class="ss-wrap">
+        <img class="ss-img" id="ss-{{ key }}" alt="preview"/>
+        <div class="ss-ph" id="ss-ph-{{ key }}">no preview</div>
+        <div class="step-lbl" id="step-{{ key }}"></div>
       </div>
-      <div class="phone-wrap">
-        <div class="phone-notch"></div>
-        <img id="live-img" alt="browser preview"/>
-        <div id="live-ph">
-          <div class="ph-icon">🖥️</div>
-          <div class="ph-text">Browser view appears here<br/>once the engine starts.</div>
-        </div>
+      <div class="mini-log" id="log-{{ key }}">
+        <div class="ll muted">Waiting to start...</div>
       </div>
-      <div class="step-lbl" id="step-lbl"></div>
     </div>
-
-  </div>
-
-  <!-- Log -->
-  <div class="card" style="margin-top:14px">
-    <div class="card-title">
-      Live Log
-      <button class="clr-btn" onclick="clearLog()">Clear</button>
-    </div>
-    <div id="log-box">
-      <div class="ll muted">Logs will appear here when the engine starts…</div>
-    </div>
+    {% endfor %}
   </div>
 </div>
 
 <script>
-/* ── State ── */
-let selectedOffer = '50k_loans';
-let evtSrc   = null;
-let pollTmr  = null;
-let ssTmr    = null;
-let stopping = false;
+const OFFER_KEYS = {{ offer_keys | tojson }};
+const evtSrcs = {}, pollTmrs = {}, ssTmrs = {}, stopping = {};
 
-/* ── Offer selection ── */
-function pickOffer(key) {
-  selectedOffer = key;
-  document.querySelectorAll('.offer-label').forEach(el => el.classList.remove('selected'));
-  document.getElementById('lbl-' + key).classList.add('selected');
+function logCls(l) {
+  const u = l.toUpperCase();
+  if (u.includes('] OK') || u.includes('FRESH')) return 'ok';
+  if (u.includes('] WARN'))                        return 'warn';
+  if (u.includes('] ERR') || u.includes('] FAIL')) return 'err';
+  if (u.includes('] RETRY'))                       return 'rty';
+  if (u.includes('] DONE'))                        return 'done';
+  if (u.includes('] FATAL'))                       return 'ftl';
+  return 'inf';
 }
 
-/* ── Log ── */
-function appendLog(line) {
-  const box = document.getElementById('log-box');
+function appendLog(key, line) {
+  const box = document.getElementById('log-' + key);
   box.querySelectorAll('.muted').forEach(e => e.remove());
   const d = document.createElement('div');
   d.className = 'll ' + logCls(line);
@@ -568,147 +477,108 @@ function appendLog(line) {
   box.appendChild(d);
   box.scrollTop = box.scrollHeight;
   const all = box.querySelectorAll('.ll');
-  if (all.length > 500) all[0].remove();
-}
-function logCls(l) {
-  const u = l.toUpperCase();
-  if (u.includes('] OK') || u.includes('SUCCESS'))  return 'ok';
-  if (u.includes('] WARN'))   return 'warn';
-  if (u.includes('] ERR'))    return 'err';
-  if (u.includes('] RETRY'))  return 'rty';
-  if (u.includes('] DONE'))   return 'done';
-  if (u.includes('] FATAL'))  return 'ftl';
-  return 'inf';
-}
-function clearLog() {
-  document.getElementById('log-box').innerHTML = '<div class="ll muted">Log cleared.</div>';
+  if (all.length > 300) all[0].remove();
 }
 
-/* ── Stats ── */
-function updStats(s) {
-  document.getElementById('s-ok').textContent   = s.success;
-  document.getElementById('s-dup').textContent  = s.duplicate;
-  document.getElementById('s-fail').textContent = s.failed;
-  document.getElementById('s-proc').textContent = s.processed;
-  document.getElementById('s-tot').textContent  = s.total;
-}
-
-/* ── Running state ── */
-function setRunning(running) {
-  const badge = document.getElementById('badge');
-  document.getElementById('btn-start').disabled = running;
-  document.getElementById('btn-stop').disabled  = !running || stopping;
-  document.getElementById('live-badge').classList.toggle('on', running);
-
+function setRunning(key, running) {
+  const card  = document.getElementById('card-' + key);
+  const badge = document.getElementById('badge-' + key);
+  document.getElementById('btn-start-' + key).disabled = running;
+  document.getElementById('btn-stop-'  + key).disabled = !running || !!stopping[key];
+  card.classList.toggle('is-running',  running && !stopping[key]);
+  card.classList.toggle('is-stopping', !!stopping[key]);
   if (running) {
-    stopping = false;
-    badge.className   = 'badge running';
-    badge.textContent = 'RUNNING';
-    document.getElementById('status-sub').textContent = '';
+    stopping[key] = false;
+    badge.className = 'badge running'; badge.textContent = 'RUNNING';
   } else {
-    badge.className   = 'badge idle';
-    badge.textContent = 'IDLE';
-    if (stopping) {
-      document.getElementById('status-sub').textContent = '';
-      stopping = false;
-    }
+    badge.className = 'badge idle'; badge.textContent = 'IDLE';
+    stopping[key] = false; card.classList.remove('is-stopping');
   }
 }
 
-/* ── Screenshot polling ──
-   Every second, load /screenshot with a cache-busting param.
-   If it returns 200 + a valid image, show it and hide the placeholder.
-   If it returns 204 (file not ready yet), keep showing whatever was last shown.
-*/
-function startSsPoll() {
-  if (ssTmr) clearInterval(ssTmr);
-  ssTmr = setInterval(fetchSs, 1000);
-}
-function stopSsPoll() {
-  if (ssTmr) { clearInterval(ssTmr); ssTmr = null; }
-}
-function fetchSs() {
-  const probe = new Image();
-  probe.onload = () => {
-    const img = document.getElementById('live-img');
-    const ph  = document.getElementById('live-ph');
-    img.src            = probe.src;
-    img.style.display  = 'block';
-    ph.style.display   = 'none';
-  };
-  // onerror: file not created yet or 204 — leave the last good frame visible
-  probe.src = '/screenshot?t=' + Date.now();
+function updStats(key, s) {
+  document.getElementById('s-fresh-' + key).textContent = s.fresh ?? 0;
+  document.getElementById('s-dup-'   + key).textContent = s.duplicate;
+  document.getElementById('s-proc-'  + key).textContent = s.processed;
+  document.getElementById('s-tot-'   + key).textContent = s.total;
 }
 
-/* ── SSE log stream ── */
-function startSSE() {
-  if (evtSrc) evtSrc.close();
-  evtSrc = new EventSource('/logs');
-  evtSrc.onmessage = e => {
+function startSsPoll(key) {
+  if (ssTmrs[key]) clearInterval(ssTmrs[key]);
+  ssTmrs[key] = setInterval(() => {
+    const probe = new Image();
+    probe.onload = () => {
+      const img = document.getElementById('ss-' + key);
+      const ph  = document.getElementById('ss-ph-' + key);
+      img.src = probe.src; img.style.display = 'block'; ph.style.display = 'none';
+    };
+    probe.src = '/screenshot/' + key + '?t=' + Date.now();
+  }, 1500);
+}
+function stopSsPoll(key) { if (ssTmrs[key]) { clearInterval(ssTmrs[key]); delete ssTmrs[key]; } }
+
+function startSSE(key) {
+  if (evtSrcs[key]) evtSrcs[key].close();
+  evtSrcs[key] = new EventSource('/logs/' + key);
+  evtSrcs[key].onmessage = e => {
     if (!e.data || !e.data.trim()) return;
-    appendLog(e.data);
-    // Update live step label from form.step events
+    appendLog(key, e.data);
     const m = e.data.match(/form\.step.*?step=(\d+).*?title="([^"]+)"/);
-    if (m) document.getElementById('step-lbl').textContent = `Step ${m[1]} of 26: ${m[2]}`;
+    if (m) document.getElementById('step-' + key).textContent =
+             'Step ' + m[1] + ': ' + m[2].substring(0, 38);
   };
-  evtSrc.onerror   = () => setTimeout(startSSE, 2000);
+  evtSrcs[key].onerror = () => setTimeout(() => startSSE(key), 2000);
 }
 
-/* ── Status poll (stats + running flag) ── */
-function startPoll() {
-  if (pollTmr) clearInterval(pollTmr);
-  pollTmr = setInterval(async () => {
+function startPoll(key) {
+  if (pollTmrs[key]) clearInterval(pollTmrs[key]);
+  pollTmrs[key] = setInterval(async () => {
     try {
       const d = await fetch('/status').then(r => r.json());
-      setRunning(d.running);
-      updStats(d.stats);
-      if (!d.running) {
-        clearInterval(pollTmr); pollTmr = null;
-        stopSsPoll();
-        document.getElementById('step-lbl').textContent = '';
+      const eng = d[key]; if (!eng) return;
+      setRunning(key, eng.running); updStats(key, eng.stats);
+      if (!eng.running) {
+        clearInterval(pollTmrs[key]); delete pollTmrs[key];
+        stopSsPoll(key);
+        document.getElementById('step-' + key).textContent = '';
       }
-    } catch (_) {}
+    } catch(_) {}
   }, 1500);
 }
 
-/* ── Start ── */
-async function startEngine() {
-  document.getElementById('btn-start').disabled = true;
-  const d = await fetch('/start', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ offer: selectedOffer }),
-  }).then(r => r.json()).catch(() => ({ ok: false, msg: 'Network error' }));
-
-  if (d.ok) {
-    setRunning(true);
-    startSSE();
-    startPoll();
-    startSsPoll();
-  } else {
-    alert(d.msg || 'Could not start engine.');
-    document.getElementById('btn-start').disabled = false;
-  }
+async function startEngine(key) {
+  document.getElementById('btn-start-' + key).disabled = true;
+  const d = await fetch('/start/' + key, { method: 'POST' })
+    .then(r => r.json()).catch(() => ({ ok: false, msg: 'Network error' }));
+  if (d.ok) { setRunning(key, true); startSSE(key); startPoll(key); startSsPoll(key); }
+  else { alert(d.msg || 'Could not start.'); document.getElementById('btn-start-' + key).disabled = false; }
 }
 
-/* ── Stop ── */
-async function stopEngine() {
-  stopping = true;
-  document.getElementById('btn-stop').disabled = true;
-  document.getElementById('badge').className   = 'badge stopping';
-  document.getElementById('badge').textContent = 'STOPPING';
-  document.getElementById('status-sub').textContent = '(finishing current step…)';
-  await fetch('/stop', { method: 'POST' }).catch(() => {});
+async function stopEngine(key) {
+  stopping[key] = true;
+  document.getElementById('btn-stop-' + key).disabled = true;
+  const badge = document.getElementById('badge-' + key);
+  badge.className = 'badge stopping'; badge.textContent = 'STOPPING';
+  document.getElementById('card-' + key).classList.replace('is-running', 'is-stopping');
+  await fetch('/stop/' + key, { method: 'POST' }).catch(() => {});
 }
 
-/* ── Init: sync with server on page load ── */
+function stopAll() {
+  OFFER_KEYS.forEach(key => {
+    const b = document.getElementById('badge-' + key);
+    if (b && b.textContent === 'RUNNING') stopEngine(key);
+  });
+}
+
 (async () => {
   try {
     const d = await fetch('/status').then(r => r.json());
-    setRunning(d.running);
-    updStats(d.stats);
-    if (d.running) { startSSE(); startPoll(); startSsPoll(); }
-  } catch (_) {}
+    OFFER_KEYS.forEach(key => {
+      const eng = d[key]; if (!eng) return;
+      setRunning(key, eng.running); updStats(key, eng.stats);
+      if (eng.running) { startSSE(key); startPoll(key); startSsPoll(key); }
+    });
+  } catch(_) {}
 })();
 </script>
 </body>
@@ -720,80 +590,88 @@ async function stopEngine() {
 
 @app.route("/")
 def index():
-    return render_template_string(_HTML, offers=OFFERS)
+    return render_template_string(_HTML, offers=OFFERS, offer_keys=list(OFFERS.keys()))
 
 
-@app.route("/start", methods=["POST"])
-def start():
-    if _state["running"]:
-        return jsonify({"ok": False, "msg": "Engine is already running."})
-    data = request.get_json(silent=True) or {}
-    offer_key = data.get("offer", "50k_loans")
-    offer = OFFERS.get(offer_key, OFFERS["50k_loans"])
-    _state["selected_offer"] = offer_key
-    _state["stop_event"].clear()
-    # Drain stale logs from previous run
-    while not _state["log_queue"].empty():
-        try: _state["log_queue"].get_nowait()
-        except queue.Empty: break
-    t = threading.Thread(target=_run_engine, args=(offer["url"],), daemon=True)
-    _state["thread"] = t
+@app.route("/start/<offer_id>", methods=["POST"])
+def start(offer_id: str):
+    if offer_id not in OFFERS:
+        return jsonify({"ok": False, "msg": f"Unknown offer: {offer_id}"})
+    eng = _engines[offer_id]
+    if eng["running"]:
+        return jsonify({"ok": False, "msg": f"{OFFERS[offer_id]['name']} is already running."})
+    offer = OFFERS[offer_id]
+    eng["stop_event"].clear()
+    while not eng["log_queue"].empty():
+        try:
+            eng["log_queue"].get_nowait()
+        except queue.Empty:
+            break
+    t = threading.Thread(target=_run_engine, args=(offer_id, offer["url"]), daemon=True)
+    eng["thread"] = t
     t.start()
-    _log(f"INFO  Engine started — offer: {offer['name']}")
+    _log(offer_id, f"INFO  Engine started -- {offer['name']}")
     return jsonify({"ok": True})
 
 
-@app.route("/stop", methods=["POST"])
-def stop():
-    _state["stop_event"].set()
-    _log("INFO  Stop requested — will halt after the current form step completes…")
+@app.route("/stop/<offer_id>", methods=["POST"])
+def stop(offer_id: str):
+    if offer_id not in _engines:
+        return jsonify({"ok": False, "msg": "Unknown offer"})
+    _engines[offer_id]["stop_event"].set()
+    _log(offer_id, "INFO  Stop requested -- will halt after the current form step...")
     return jsonify({"ok": True})
 
 
 @app.route("/status")
 def status():
-    return jsonify({"running": _state["running"], "stats": _state["stats"]})
+    return jsonify({
+        oid: {"running": eng["running"], "stats": eng["stats"]}
+        for oid, eng in _engines.items()
+    })
 
 
-@app.route("/screenshot")
-def screenshot():
-    """
-    Serve the live browser screenshot saved by form_filler.
-    Returns 204 (no content) if the file doesn't exist yet so the browser
-    keeps showing its last good frame rather than breaking the <img>.
-    """
-    if not _SS_PATH.exists():
+@app.route("/logs/<offer_id>")
+def logs(offer_id: str):
+    if offer_id not in _engines:
+        return "", 404
+
+    def stream():
+        q = _engines[offer_id]["log_queue"]
+        while True:
+            try:
+                msg = q.get(timeout=1.0)
+                yield f"data: {msg}\n\n"
+            except queue.Empty:
+                yield "data: \n\n"
+
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/screenshot/<offer_id>")
+def screenshot(offer_id: str):
+    if offer_id not in OFFERS:
+        return "", 404
+    p = _ss_path(offer_id)
+    if not p.exists():
         return "", 204
-    # Read into memory first so we never block a concurrent write from Playwright
     try:
-        data = _SS_PATH.read_bytes()
+        data = p.read_bytes()
     except OSError:
         return "", 204
-    from flask import make_response
     resp = make_response(data)
     resp.headers["Content-Type"]  = "image/png"
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
-@app.route("/logs")
-def logs():
-    def stream():
-        while True:
-            try:
-                msg = _state["log_queue"].get(timeout=1.0)
-                yield f"data: {msg}\n\n"
-            except queue.Empty:
-                yield "data: \n\n"   # keep-alive heartbeat
-    return Response(stream(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("\n  Lead Automation UI")
+    _setup_structlog()
+    print("\n  Lead Automation UI  (multi-engine)")
     print("  ──────────────────────────────────")
-    print("  Open in browser:  http://localhost:5000\n")
-    app.run(host="0.0.0.0", port=5000, debug=False,
+    print("  Open in browser:  http://localhost:8080\n")
+    app.run(host="0.0.0.0", port=8080, debug=False,
             use_reloader=False, threaded=True)

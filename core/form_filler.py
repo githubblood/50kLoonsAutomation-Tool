@@ -39,18 +39,18 @@ from typing import Any
 import structlog
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Frame, Page
 
-from utils.stealth import inject_stealth
+from core.exceptions import FormFillerError
+from core.site_classify import (
+    click_page_ctas,
+    ensure_iframe_global,
+    finish_if_classified_on_site,
+    has_iframe_global,
+    maybe_fresh_at_step_start,
+    validate_classify_fields,
+)
 from utils.proxy_manager import ProxyManager
 
 log = structlog.get_logger(__name__)
-
-
-class FormFillerError(Exception):
-    """Base exception for form-filling errors."""
-
-    def __init__(self, message: str, error_type: str = "unknown"):
-        super().__init__(message)
-        self.error_type = error_type
 
 
 class FormFiller:
@@ -100,7 +100,6 @@ class FormFiller:
     def process_row(
         self,
         row: dict[str, Any],
-        fingerprint: dict[str, Any],
         proxy_url: str | None,
         row_number: int,
         stop_event=None,
@@ -117,10 +116,8 @@ class FormFiller:
 
             browser: Browser = pw.chromium.launch(**launch_args)
             try:
-                ctx_args = self._clean_fingerprint(fingerprint)
-                context: BrowserContext = browser.new_context(**ctx_args)
+                context: BrowserContext = browser.new_context()
                 page: Page = context.new_page()
-                inject_stealth(page, fingerprint)
 
                 url = self._target.get("url", "https://50kloans.com")
                 log.info("form.navigating", url=url, row=row_number)
@@ -128,6 +125,11 @@ class FormFiller:
                     page.goto(url, wait_until="networkidle", timeout=30000)
                 except Exception:
                     pass  # networkidle may never fire on SPAs; continue once DOM loaded
+                if (page.url or "").startswith("chrome-error://"):
+                    raise FormFillerError(
+                        f"Page failed to load ({page.url}) — proxy unreachable or blocked",
+                        error_type="proxy_error",
+                    )
                 time.sleep(5)
                 try:
                     page.screenshot(path=str(self._ss_dir / "live_view.png"))
@@ -162,17 +164,73 @@ class FormFiller:
             finally:
                 browser.close()
 
+    def classify_lead_on_site(
+        self,
+        row: dict[str, Any],
+        proxy_url: str | None,
+        row_number: int,
+        stop_event=None,
+    ) -> dict[str, str]:
+        """Check duplicate vs fresh on the live website (email + SSN steps only)."""
+        headless = os.getenv("HEADLESS", "true").lower() == "true"
+        fields = self._parse_fields(row)
+        validate_classify_fields(fields, row_number=row_number)
+
+        with sync_playwright() as pw:
+            launch_args: dict[str, Any] = {"headless": headless}
+            if proxy_url:
+                launch_args["proxy"] = ProxyManager.to_playwright_proxy(proxy_url)
+
+            browser: Browser = pw.chromium.launch(**launch_args)
+            try:
+                context: BrowserContext = browser.new_context()
+                page: Page = context.new_page()
+
+                self._ensure_iframe_for_classify(page, row_number, fields)
+
+                self._fill_form(
+                    page, fields, row_number, stop_event=stop_event, classify_only=True
+                )
+                context.close()
+                return {
+                    "status": "Fresh",
+                    "notes": "Website: new lead (passed email/SSN check)",
+                }
+            except FormFillerError as exc:
+                if exc.error_type == "duplicate":
+                    return {"status": "Duplicate", "notes": str(exc)}
+                raise
+            finally:
+                browser.close()
+
     # --------------------------------------------------------------- form flow
 
-    def _fill_form(self, page: Page, f: dict, row_number: int, stop_event=None) -> None:
+    def _fill_form(
+        self,
+        page: Page,
+        f: dict,
+        row_number: int,
+        stop_event=None,
+        *,
+        classify_only: bool = False,
+    ) -> None:
         """Main form-fill loop — iterates through all iframe.global steps."""
-        frame = self._get_frame(page)
+        self._classify_only = classify_only
+        if classify_only and not has_iframe_global(page):
+            self._ensure_iframe_for_classify(page, row_number, f)
+        frame = self._get_frame(
+            page, wait_seconds=15 if classify_only else 30, require_iframe=classify_only
+        )
         log.info("form.frame", url=frame.url[:80], row=row_number)
-        time.sleep(5)  # let the SPA fully render before polling
+        if not classify_only:
+            time.sleep(5)  # let the SPA render before polling
 
         prev_title = ""
-        for step_num in range(0, 60):
-            time.sleep(1)
+        blank_steps = 0
+        max_steps = 25 if classify_only else 60
+        for step_num in range(0, max_steps):
+            if not classify_only:
+                time.sleep(1)
             if stop_event and stop_event.is_set():
                 raise FormFillerError("Stopped by user", error_type="stopped")
             try:
@@ -195,14 +253,21 @@ class FormFiller:
                 return
 
             if not title:
-                # Re-fetch the frame — it may have detached/reloaded.
-                frame = self._get_frame(page)
-                if step_num == 0:
-                    time.sleep(3)
-                    continue
-                log.warning("form.no_title", step=step_num, row=row_number)
-                time.sleep(3)
+                blank_steps += 1
+                if classify_only and blank_steps >= 12:
+                    raise FormFillerError(
+                        "Website form did not load (no step title)",
+                        error_type="stuck",
+                    )
+                frame = self._get_frame(page, wait_seconds=3 if classify_only else 30)
+                # The iframe is lazy-loaded; its first step renders a moment after
+                # the frame appears. Wait briefly each blank iteration (even in
+                # classify mode) so we don't burn the budget before the title shows.
+                time.sleep(0.7 if classify_only else 3)
+                if step_num != 0:
+                    log.warning("form.no_title", step=step_num, row=row_number)
                 continue
+            blank_steps = 0
 
             # ── Duplicate detection ─────────────────────────────────────────
             # Signal 1: "welcome back" greeting — form recognised the email as
@@ -242,12 +307,33 @@ class FormFiller:
                 )
             # ── End duplicate detection ─────────────────────────────────────
 
+            if maybe_fresh_at_step_start(
+                classify_only=classify_only,
+                title=title,
+                step_num=step_num,
+                row_number=row_number,
+                page=page,
+                screenshot=self._screenshot,
+                first_name=str(f.get("first_name") or ""),
+            ):
+                return
+
+            # Transient verification spinner after SSN ("verifying your
+            # information..."). Not a real step (no handler) — wait for it to
+            # resolve instead of falling through to _handle_step → "stuck".
+            if step_num >= 2 and any(kw in title for kw in (
+                "verifying", "checking your", "please wait", "one moment", "loading",
+            )):
+                log.info("form.verifying_wait", step=step_num, title=title[:60], row=row_number)
+                time.sleep(1.5)
+                continue
+
             log.info("form.step", step=step_num, title=title[:60], row=row_number)
-            # Update live preview BEFORE filling the step so the UI shows the active step
-            try:
-                page.screenshot(path=str(self._ss_dir / "live_view.png"))
-            except Exception:
-                pass
+            if not classify_only:
+                try:
+                    page.screenshot(path=str(self._ss_dir / "live_view.png"))
+                except Exception:
+                    pass
 
             result = self._handle_step(frame, title, f)
             if not result:
@@ -257,6 +343,20 @@ class FormFiller:
                     error_type="stuck",
                 )
 
+            if finish_if_classified_on_site(
+                classify_only=classify_only,
+                frame=frame,
+                page=page,
+                title=title,
+                step_num=step_num,
+                row_number=row_number,
+                get_title=self._get_title,
+                screenshot=self._screenshot,
+                wait_after_step=lambda: (None if classify_only else time.sleep(4)),
+                first_name=str(f.get("first_name") or ""),
+            ):
+                return
+
             # Final submission — clicking "Request Cash" submits the form.
             # The iframe title doesn't change after submit, so handle the
             # post-submit offer page, then return.
@@ -265,8 +365,11 @@ class FormFiller:
                 self._handle_post_submit(page, row_number)
                 return
 
-            # Wait for the form to advance
-            time.sleep(4)
+            # Wait for the form to advance — poll in classify mode, fixed sleep otherwise
+            if classify_only:
+                self._wait_title_change(frame, avoid=[], timeout=3)
+            else:
+                time.sleep(4)
 
             # Check if stuck on the same step
             try:
@@ -275,7 +378,8 @@ class FormFiller:
                 new_title = ""
 
             if new_title and new_title == prev_title and step_num > 0:
-                time.sleep(3)
+                if not classify_only:
+                    time.sleep(3)
                 try:
                     new_title = self._get_title(frame).lower().strip()
                 except Exception:
@@ -288,12 +392,18 @@ class FormFiller:
                     )
 
             prev_title = title
-            try:
-                page.screenshot(path=str(self._ss_dir / "live_view.png"))
-            except Exception:
-                pass
+            if not classify_only:
+                try:
+                    page.screenshot(path=str(self._ss_dir / "live_view.png"))
+                except Exception:
+                    pass
 
-        raise FormFillerError("Form did not complete within 60 steps", error_type="timeout")
+        msg = (
+            "Website classify did not pass email/SSN within 60 steps"
+            if classify_only
+            else "Form did not complete within 60 steps"
+        )
+        raise FormFillerError(msg, error_type="timeout")
 
     def _handle_post_submit(self, page: Page, row_number: int) -> None:
         """After 'Request Cash' is clicked, the iframe shows a processing screen
@@ -442,26 +552,56 @@ class FormFiller:
 
         # ── Step 0: Loan amount ──────────────────────────────────────────────
         if "how much" in title or ("amount" in title and "loan" in title):
-            return self._chip(frame, f["loan_amount_chip"])
+            return self._handle_loan_amount_step(frame, f)
 
         # ── Step 1: Email ────────────────────────────────────────────────────
         if "email" in title:
-            self._fill(frame, "input[type=email], input[name*=email i]", f["email"])
-            time.sleep(1)
-            return self._continue(frame)
+            email = f["email"]
+            ok = self._react_fill_any(
+                frame,
+                [
+                    'input[name="email"]',
+                    "input[type=email]",
+                    "input[autocomplete=email]",
+                    "input[placeholder*='email' i]",
+                    "input[name*=email i]",
+                    "input[id*=email i]",
+                ],
+                email,
+            )
+            if not ok:
+                ok = self._fill_nth_visible_input(frame, 0, email)
+            if not ok:
+                ok = self._type_email_fallback(frame, email)
+            self._dispatch_input_blur(frame, 'input[name="email"], input[type=email]')
+            self._ensure_visible_checkboxes_checked(frame)
+            time.sleep(0.2 if self._classify_only else 0.8)
+            if self._wait_and_click_continue(frame, timeout_s=12 if self._classify_only else 25):
+                return "CONTINUE"
+            result = self._continue(frame)
+            return result or "EMAIL"
 
         # ── Step 2 / 22: SSN (last-4 or full) ──────────────────────────────
         if "ssn" in title or ("social" in title and "secur" in title):
             if "last" in title or "4" in title or "digit" in title:
-                self._fill(frame, 'input[name="last_ssn"]', f["last_ssn"])
+                self._react_fill_any(
+                    frame, ['input[name="last_ssn"]', "input:visible"], f["last_ssn"]
+                ) or self._fill(frame, 'input[name="last_ssn"]', f["last_ssn"])
             else:
-                self._fill(
+                self._react_fill_any(
+                    frame,
+                    ['input[name="ssn"]', 'input[name*="ssn" i]', "input:visible"],
+                    f["ssn"],
+                ) or self._fill(
                     frame,
                     'input[name="ssn"], input[name*="ssn" i], input:visible',
                     f["ssn"],
                 )
-            time.sleep(1)
-            return self._continue(frame)
+            time.sleep(0.2 if self._classify_only else 0.8)
+            if self._wait_and_click_continue(frame, timeout_s=10 if self._classify_only else 18):
+                return "CONTINUE"
+            result = self._continue(frame)
+            return result or "SSN"
 
         # ── Step 3: Credit score ─────────────────────────────────────────────
         if "credit" in title and ("score" in title or "rating" in title) and "trial" not in title:
@@ -707,14 +847,120 @@ class FormFiller:
 
     # ---------------------------------------------------------------- helpers
 
-    def _get_frame(self, page: Page) -> Frame:
-        for _ in range(30):
-            frames = [f for f in page.frames if "iframe.global" in f.url]
+    def _wait_for_50k_landing(self, page: Page, *, timeout_s: float = 25) -> None:
+        """Wait for trackier redirect or iframe after navigation."""
+        deadline = time.time() + timeout_s
+        poll = 0.2 if getattr(self, "_classify_only", False) else 1
+        while time.time() < deadline:
+            if has_iframe_global(page):
+                return
+            low = (page.url or "").lower()
+            if "50kloans" in low or "iframe.global" in low:
+                return
+            if "gotrackier" not in low and "trackier" not in low and low.startswith("http"):
+                return
+            time.sleep(poll)
+
+    def _ensure_iframe_for_classify(
+        self, page: Page, row_number: int, fields: dict[str, Any]
+    ) -> None:
+        """Navigate through trackier/50k entry points until iframe.global loads."""
+        loan = str(fields.get("loan_amount_value") or fields.get("loan_amount_chip") or "5000")
+        urls: list[str] = []
+        for u in (
+            "https://50kloans.com/",
+            "https://www.50kloans.com/",
+            self._target.get("url", ""),
+        ):
+            u = (u or "").strip()
+            if u and u not in urls:
+                urls.append(u)
+
+        last_err: FormFillerError | None = None
+        for url in urls:
+            log.info("form.classify_navigating", url=url, row=row_number)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+            if (page.url or "").startswith("chrome-error://"):
+                continue
+            self._wait_for_50k_landing(page)
+            click_page_ctas(page, loan_amount=loan)
+            # The form iframe (#application-form, style=nova) is lazy-loaded on
+            # the homepage and only loads once scrolled into view — clicking the
+            # "Request Funds" anchor alone is not enough in headless.
+            for _ in range(25):
+                self._scroll_iframe_into_view(page)
+                if has_iframe_global(page):
+                    log.info("form.classify_iframe_ready", url=url, row=row_number)
+                    return
+                time.sleep(0.4)
+            try:
+                ensure_iframe_global(page, timeout_s=15, loan_amount=loan)
+                return
+            except FormFillerError as exc:
+                last_err = exc
+                log.warning("form.classify_iframe_retry", url=url, row=row_number)
+
+        raise last_err or FormFillerError(
+            "Loan form iframe did not load on website",
+            error_type="stuck",
+        )
+
+    def _wait_for_iframe_ready(self, page: Page, timeout_s: int = 30) -> None:
+        ensure_iframe_global(page, timeout_s=float(timeout_s))
+
+    def _get_frame(
+        self, page: Page, *, wait_seconds: int = 30, require_iframe: bool = False
+    ) -> Frame:
+        if (page.url or "").startswith("chrome-error://"):
+            raise FormFillerError(
+                f"Page failed to load ({page.url}) — proxy unreachable or blocked",
+                error_type="proxy_error",
+            )
+        poll_interval = 0.2 if getattr(self, "_classify_only", False) else 1
+        checks = int(wait_seconds / poll_interval)
+        for _ in range(checks):
+            frames = [
+                f for f in page.frames
+                if "iframe.global" in (f.url or "") and f != page.main_frame
+            ]
             if frames:
-                return frames[0]
-            time.sleep(1)
+                prefer = [
+                    f for f in frames
+                    if "50K" in (f.url or "").upper()
+                    or "50k" in (f.url or "").lower()
+                    or "style=nova" in (f.url or "").lower()
+                ]
+                return prefer[0] if prefer else frames[0]
+            # The form iframe (#application-form, src=iframe.global) is lazy-loaded
+            # on scroll; actively nudge it into view each poll so it loads even
+            # under concurrent CPU load.
+            self._scroll_iframe_into_view(page)
+            time.sleep(poll_interval)
+        if require_iframe or getattr(self, "_classify_only", False):
+            raise FormFillerError(
+                "Loan form iframe did not load on website",
+                error_type="stuck",
+            )
         log.warning("form.iframe_not_found", fallback="main_frame")
         return page.main_frame
+
+    def _scroll_iframe_into_view(self, page: Page) -> None:
+        """Trigger the lazy-loaded #application-form iframe by scrolling it into view."""
+        try:
+            page.evaluate(
+                """() => {
+                    const f = document.querySelector(
+                        '#application-form, #loan-form, iframe[src*="iframe.global"]'
+                    );
+                    if (f) f.scrollIntoView({block: 'center'});
+                }"""
+            )
+            page.mouse.wheel(0, 500)
+        except Exception:
+            pass
 
     def _get_title(self, frame: Frame) -> str:
         try:
@@ -729,29 +975,276 @@ class FormFiller:
     def _fill(self, frame: Frame, selector: str, value: str) -> bool:
         try:
             loc = frame.locator(selector).first
-            loc.wait_for(state="visible", timeout=5000)
+            loc.wait_for(state="visible", timeout=2000 if getattr(self, "_classify_only", False) else 5000)
             loc.fill(str(value))
             return True
         except Exception as e:
             log.warning("form.fill_error", selector=selector[:60], error=str(e)[:80])
             return False
 
-    def _chip(self, frame: Frame, text_fragment: str) -> str | None:
+    def _handle_loan_amount_step(self, frame: Frame, f: dict) -> str | None:
+        """Click loan amount chip (exact digit match — avoids $5,000 vs $50,000)."""
+        chip = str(f.get("loan_amount_chip") or "").strip()
+        val = str(f.get("loan_amount_value") or "").strip()
+        clicked = self._click_loan_chip_js(frame, val or chip)
+        if not clicked:
+            for c in (chip, "$5,000", "$2,500", "$1,000", "$10,000", "$500", "$250"):
+                clicked = self._click_loan_chip_js(frame, c)
+                if clicked:
+                    break
+        if clicked:
+            time.sleep(0.2)
+            if not self._wait_title_change(
+                frame, avoid=["how much", "amount", "loan"], timeout=8
+            ):
+                self._wait_and_click_continue(frame, timeout_s=10)
+                self._wait_title_change(
+                    frame, avoid=["how much", "amount", "loan"], timeout=6
+                )
+            return clicked
+        return self._chip(frame, chip, exact_digits=True)
+
+    def _click_loan_chip_js(self, frame: Frame, amount: str) -> str | None:
+        """Click a loan amount chip by matching numeric value."""
+        digits = re.sub(r"\D", "", str(amount or ""))
+        if not digits:
+            return None
+        label = str(amount or "").strip()
+        if not label.startswith("$") and digits:
+            try:
+                label = f"${int(digits):,}"
+            except ValueError:
+                pass
+        for sel in (
+            "button.lcf-option",
+            "button[class*='chip']",
+            "button[class*='option']",
+            "button",
+            '[class*="chip"]',
+            '[class*="option"]',
+        ):
+            try:
+                loc = frame.locator(sel).filter(has_text=label).first
+                if loc.is_visible(timeout=1000):
+                    loc.click(timeout=5000)
+                    return label
+            except Exception:
+                pass
+        try:
+            return frame.evaluate(
+                """(digits) => {
+                    const pools = [
+                        ...document.querySelectorAll('button.lcf-option'),
+                        ...document.querySelectorAll('button[class*="chip"]'),
+                        ...document.querySelectorAll('button[class*="option"]'),
+                        ...document.querySelectorAll('button'),
+                        ...document.querySelectorAll('[class*="chip"]'),
+                        ...document.querySelectorAll('[class*="option"]'),
+                    ];
+                    const seen = new Set();
+                    for (const b of pools) {
+                        if (!b || seen.has(b)) continue;
+                        seen.add(b);
+                        if (!b.offsetParent) continue;
+                        const d = (b.textContent || '').replace(/\\D/g, '');
+                        if (d === digits) {
+                            b.click();
+                            return (b.textContent || '').trim();
+                        }
+                    }
+                    return null;
+                }""",
+                digits,
+            )
+        except Exception:
+            return None
+
+    def _wait_title_change(
+        self, frame: Frame, avoid: list[str] | None = None, timeout: float = 12
+    ) -> bool:
+        """Wait until the step title changes (chip steps often auto-advance)."""
+        avoid = [a.lower() for a in (avoid or [])]
+        try:
+            start = self._get_title(frame).lower().strip()
+        except Exception:
+            start = ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.2)
+            try:
+                cur = self._get_title(frame).lower().strip()
+            except Exception:
+                continue
+            if not cur:
+                continue
+            if cur != start and not any(a in cur for a in avoid):
+                return True
+            if start and any(a in start for a in avoid) and not any(a in cur for a in avoid):
+                return True
+        return False
+
+    def _chip(
+        self, frame: Frame, text_fragment: str, *, exact_digits: bool = False
+    ) -> str | None:
         frag = text_fragment.strip().upper()
         try:
             for sel in ["button", '[class*="chip"]', '[class*="option"]', '[class*="choice"]']:
                 for el in frame.locator(sel).all():
                     t = (el.text_content() or "").strip().upper()
-                    if frag in t and el.is_visible():
+                    if exact_digits:
+                        if not self._chip_label_matches(text_fragment, t):
+                            continue
+                    elif frag not in t:
+                        continue
+                    if el.is_visible():
                         el.click(timeout=5000)
                         return t
         except Exception as e:
             log.warning("form.chip_error", fragment=text_fragment, error=str(e)[:80])
         return None
 
+    def _chip_label_matches(self, fragment: str, label: str) -> bool:
+        """Match chip labels without false positives (e.g. 5000 vs 50000)."""
+        frag_digits = re.sub(r"\D", "", fragment)
+        label_digits = re.sub(r"\D", "", label)
+        if frag_digits and label_digits:
+            return frag_digits == label_digits
+        return fragment.strip().upper() in label.strip().upper()
+
+    def _react_set_value(self, frame: Frame, selector: str, value: str) -> bool:
+        """Set input value using native setter + input/change/blur events."""
+        try:
+            loc = frame.locator(selector).first
+            if loc.count() == 0 or not loc.is_visible(timeout=500 if getattr(self, "_classify_only", False) else 1500):
+                return False
+            return bool(
+                loc.evaluate(
+                    """(el, val) => {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype,
+                            "value"
+                        )?.set;
+                        if (setter) setter.call(el, String(val));
+                        else el.value = String(val);
+                        el.dispatchEvent(new Event("input", { bubbles: true }));
+                        el.dispatchEvent(new Event("change", { bubbles: true }));
+                        el.dispatchEvent(new Event("blur", { bubbles: true }));
+                        return true;
+                    }""",
+                    str(value),
+                )
+            )
+        except Exception:
+            return False
+
+    def _react_fill_any(self, frame: Frame, selectors: list[str], value: str) -> bool:
+        for sel in selectors:
+            if self._react_set_value(frame, sel, value):
+                return True
+        return False
+
+    def _type_email_fallback(self, frame: Frame, email: str) -> bool:
+        """Type email character-by-character when React ignores programmatic fills."""
+        selectors = [
+            'input[name="email"]',
+            "input[type=email]",
+            "input[autocomplete=email]",
+            "input[placeholder*='email' i]",
+            "input[id*=email i]",
+            "input[name*=email i]",
+            "input:visible",
+        ]
+        for sel in selectors:
+            try:
+                loc = frame.locator(sel).first
+                if loc.count() == 0 or not loc.is_visible(timeout=300 if self._classify_only else 800):
+                    continue
+                loc.click(timeout=2000)
+                try:
+                    loc.press("Control+a")
+                    loc.press("Delete")
+                except Exception:
+                    pass
+                loc.press_sequentially(email, delay=20)
+                try:
+                    loc.press("Tab")
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _dispatch_input_blur(self, frame: Frame, selector: str) -> None:
+        try:
+            frame.locator(selector).first.evaluate(
+                """(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                }"""
+            )
+        except Exception:
+            pass
+
+    def _fill_nth_visible_input(self, frame: Frame, n: int, value: str) -> bool:
+        try:
+            loc = frame.locator("input:visible").nth(n)
+            loc.wait_for(state="visible", timeout=1000 if getattr(self, "_classify_only", False) else 3000)
+            loc.fill(str(value))
+            return True
+        except Exception:
+            return False
+
+    def _ensure_visible_checkboxes_checked(self, frame: Frame) -> None:
+        try:
+            frame.evaluate(
+                """() => {
+                    const boxes = Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                      .filter(b => b && b.offsetParent !== null);
+                    for (const b of boxes) {
+                      try { if (!b.checked) b.click(); } catch(e) {}
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+    def _wait_and_click_continue(self, frame: Frame, timeout_s: float = 18) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                clicked = bool(
+                    frame.evaluate(
+                        """() => {
+                            const candidates = [
+                              document.querySelector('button.lcf-btn-primary'),
+                              document.querySelector('#continue-button'),
+                              document.querySelector('button#continue-button'),
+                              ...Array.from(document.querySelectorAll('button')).filter(
+                                b => /continue|next|apply|submit|request/i.test((b.textContent||'').trim())
+                              ),
+                            ];
+                            for (const b of candidates) {
+                              if (!b || b.offsetParent === null) continue;
+                              if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+                              b.click();
+                              return true;
+                            }
+                            return false;
+                        }"""
+                    )
+                )
+                if clicked:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.25)
+        return False
+
     def _continue(self, frame: Frame) -> str | None:
         for kw in ["CONTINUE", "NEXT", "SUBMIT", "APPLY NOW", "APPLY", "GET STARTED", "REQUEST CASH"]:
-            for attempt in range(3):
+            for attempt in range(2):
                 try:
                     for btn in frame.locator("button").all():
                         t = (btn.text_content() or "").strip().upper()
@@ -760,8 +1253,8 @@ class FormFiller:
                             return kw
                 except Exception:
                     pass
-                if attempt < 2:
-                    time.sleep(0.8)
+                if attempt < 1:
+                    time.sleep(0.3)
         return None
 
     # ---------------------------------------------------------------- parsing
@@ -798,7 +1291,8 @@ class FormFiller:
         dob = self._normalize_dob(g("Date of Birth (DOB)", "dob"))
 
         # Address
-        zip_code = g("ZIP Code", "Zip")
+        _zip_raw = re.sub(r"\D", "", g("ZIP Code", "Zip"))
+        zip_code = _zip_raw.zfill(5) if _zip_raw else ""
         street = g("Street Address", "Address")
         city = g("City")
         state = self._normalize_state(g("State"))
@@ -855,6 +1349,7 @@ class FormFiller:
             "city": city,
             "state": state,
             "loan_amount_chip": loan_amount_chip,
+            "loan_amount_value": str(loan_int),
             "credit_chip": credit_chip,
             "pay_freq_chip": pay_freq_chip,
             "monthly_income": monthly_income,
@@ -965,11 +1460,3 @@ class FormFiller:
             return "timeout"
         return "unknown"
 
-    def _clean_fingerprint(self, fp: dict) -> dict:
-        allowed = {
-            "user_agent", "viewport", "locale", "timezone_id",
-            "geolocation", "color_scheme", "device_scale_factor",
-            "is_mobile", "has_touch", "java_script_enabled",
-            "extra_http_headers",
-        }
-        return {k: v for k, v in fp.items() if k in allowed and v is not None}

@@ -1,0 +1,20 @@
+# Keep the Vercel bundle small & secrets out of it.
+venv/
+__pycache__/
+*.pyc
+*.bak
+
+# Secrets — set these as Environment Variables in the Vercel dashboard instead.
+.env
+credentials/
+
+# Runtime artifacts — not used by the UI on Vercel.
+logs/
+screenshots/
+proxies.txt
+
+# Heavy engine code that can't run on Vercel (kept in repo, just not shipped to the function).
+diagnose_50k.py
+Dockerfile
+docker-compose.yml
+deploy/

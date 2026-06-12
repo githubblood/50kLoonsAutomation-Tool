@@ -3,7 +3,8 @@ utils/proxy_manager.py
 ──────────────────────
 Proxy rotation engine.
 
-Supports three proxy sources (configured via PROXY_SOURCE env var):
+Supports proxy sources (configured via PROXY_SOURCE env var):
+  0. "none"     → no proxy; use the machine's current IP
   1. "file"     → reads from proxies.txt (one proxy per line)
   2. "env"      → reads comma-separated list from PROXY_LIST env var
   3. "rotating" → uses a single rotating-gateway URL (e.g. Bright Data)
@@ -46,7 +47,9 @@ class ProxyManager:
         self._proxy_carriers: dict[str, str | None] = {}
         self._current_carrier: str | None = None
 
-        if source == "file":
+        if source in ("none", "direct", "off", "disabled"):
+            log.info("proxy.disabled", msg="Running on current machine IP (no proxy)")
+        elif source == "file":
             self._load_from_file()
         elif source == "env":
             self._load_from_env()

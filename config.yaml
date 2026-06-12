@@ -4,7 +4,7 @@
 
 # --- Target Form ---
 target:
-  url: "https://spaxads.gotrackier.com/click?campaign_id=1128&pub_id=2"  # Target URL
+  url: "https://50kloans.com/"  # Target URL
 
   # The form is a multi-step iframe form — selectors are hardcoded in form_filler.py
   # (form_fields section not used for this target)
@@ -18,14 +18,14 @@ retry:
   backoff_base: 2               # Exponential backoff base (seconds)
   backoff_max: 30               # Cap on backoff delay
 
-# --- Delays (seconds) — human-like pacing ---
+# --- Delays (seconds) ---
 delays:
-  min_typing_delay: 0.04        # Min delay between keystrokes
-  max_typing_delay: 0.12        # Max delay between keystrokes
-  min_action_delay: 0.5         # Min pause between form actions
-  max_action_delay: 2.0         # Max pause between form actions
-  page_load_wait: 3             # Extra wait after page load
-  pre_submit_wait: 1.5          # Pause before clicking submit
+  min_typing_delay: 0.02        # Min delay between keystrokes
+  max_typing_delay: 0.05        # Max delay between keystrokes
+  min_action_delay: 0.2         # Min pause between form actions
+  max_action_delay: 0.8         # Max pause between form actions
+  page_load_wait: 1             # Extra wait after page load
+  pre_submit_wait: 0.5          # Pause before clicking submit
 
 # --- Device Emulation Defaults ---
 # These apply when Use_Custom_Device != "yes" in the sheet

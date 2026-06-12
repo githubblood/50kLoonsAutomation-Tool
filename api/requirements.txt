@@ -1,0 +1,8 @@
+# Slim deps for the Vercel-hosted UI only.
+# The automation engine (playwright, gspread, structlog, etc.) does NOT run
+# on Vercel — see api/README_VERCEL.md. Keeping this minimal avoids the
+# serverless bundle-size limit.
+flask==3.1.1
+requests==2.32.3
+pyyaml==6.0.2
+python-dotenv==1.1.0

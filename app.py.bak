@@ -1,0 +1,799 @@
+"""
+app.py — Lead Automation Web UI
+────────────────────────────────
+Flask server that lets the user pick an offer, then start/stop the engine.
+Run with:  python app.py
+Then open: http://localhost:5000
+"""
+from __future__ import annotations
+
+import os
+import queue
+import socket
+import threading
+import time
+import traceback
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests as _requests
+import yaml
+from dotenv import load_dotenv
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
+
+import urllib3.util.connection as _urllib3_cn
+_urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
+load_dotenv()
+
+app = Flask(__name__)
+
+# ── Offers ────────────────────────────────────────────────────────────────────
+
+OFFERS: dict[str, dict] = {
+    "low_credit":     {"name": "Low Credit Finance",    "url": "https://lowcreditfinance.com"},
+    "50k_loans":      {"name": "50k Loans",             "url": "https://50kloans.com/"},
+    "super_personal": {"name": "Super Personal Finder", "url": "https://superpersonalfinder.com"},
+    "borrow_money":   {"name": "BorrowMoney",           "url": "https://borrowmoney.us"},
+}
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+
+_state: dict = {
+    "running":       False,
+    "stop_event":    threading.Event(),
+    "thread":        None,
+    "log_queue":     queue.Queue(maxsize=1000),
+    "stats":         {"success": 0, "failed": 0, "duplicate": 0, "total": 0, "processed": 0},
+    "selected_offer":"50k_loans",
+}
+
+_SS_PATH = Path("screenshots/live_view.png")   # written by form_filler, read by /screenshot
+
+
+def _log(msg: str) -> None:
+    """Push each line of msg as a separate queue entry so SSE newlines never break."""
+    ts = time.strftime("%H:%M:%S")
+    for part in str(msg).splitlines() or [""]:
+        entry = f"[{ts}] {part}"
+        if _state["log_queue"].full():
+            try:
+                _state["log_queue"].get_nowait()
+            except queue.Empty:
+                pass
+        _state["log_queue"].put_nowait(entry)
+
+
+# ── Automation engine ─────────────────────────────────────────────────────────
+
+def _get_outbound_ip(proxy_url: str | None) -> str:
+    try:
+        kwargs: dict = {"timeout": 10}
+        if proxy_url:
+            kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        return _requests.get("https://api.ipify.org?format=text", **kwargs).text.strip()
+    except Exception:
+        if proxy_url:
+            return urlparse(proxy_url).hostname or "unknown"
+        return "direct"
+
+
+def _run_engine(target_url: str) -> None:
+    stop_event = _state["stop_event"]
+    _state["running"] = True
+    _state["stats"] = {"success": 0, "failed": 0, "duplicate": 0, "total": 0, "processed": 0}
+
+    try:
+        import structlog
+        from utils.sheet_handler import SheetHandler
+        from utils.proxy_manager import ProxyManager
+        from utils.device_manager import DeviceManager
+        from core.form_filler import FormFiller, FormFillerError
+
+        # Forward all INFO+ structlog events (form steps, warnings, etc.) to the UI log queue.
+        def _ui_log_renderer(lgr, method, ev):
+            lvl = ev.get("level", method).upper()[:4]
+            event = str(ev.get("event", ""))
+            _skip = {"level", "event", "_record", "timestamp", "_logger"}
+
+            def _fv(v):
+                s = str(v).replace('"', "'")
+                return f'"{s}"' if " " in s else s
+
+            parts = [f"{k}={_fv(v)}" for k, v in ev.items()
+                     if k not in _skip and not k.startswith("_")][:5]
+            _log(f"{lvl}  {event}" + ("  " + "  ".join(parts) if parts else ""))
+            raise structlog.DropEvent()
+
+        structlog.configure(
+            processors=[_ui_log_renderer],
+            wrapper_class=structlog.make_filtering_bound_logger(20),
+            logger_factory=structlog.PrintLoggerFactory(file=open(os.devnull, "w")),
+            cache_logger_on_first_use=False,
+        )
+
+        with open("config.yaml") as fh:
+            config = yaml.safe_load(fh)
+        config["target"]["url"] = target_url
+        _log(f"INFO  Target → {target_url}")
+
+        _log("INFO  Connecting to Google Sheets…")
+        sheet = SheetHandler(config)
+        proxy_mgr = ProxyManager()
+        device_mgr = DeviceManager(config)
+        form_filler = FormFiller(config)
+
+        if proxy_mgr.has_proxies:
+            _log(f"INFO  Proxy pool: {proxy_mgr.total} proxy/proxies loaded")
+        else:
+            _log("WARN  No proxies — running direct")
+
+        pending = sheet.get_pending_rows()
+        if not pending:
+            _log("WARN  No pending rows found. Nothing to do.")
+            return
+
+        _state["stats"]["total"] = len(pending)
+        _log(f"INFO  {len(pending)} pending row(s) to process")
+
+        retry_cfg = config.get("retry", {})
+        max_retries = retry_cfg.get("max_retries", 3)
+        backoff_base = retry_cfg.get("backoff_base", 2)
+        backoff_max = retry_cfg.get("backoff_max", 30)
+
+        for row in pending:
+            if stop_event.is_set():
+                _log("INFO  Stop signal received — halting.")
+                break
+
+            row_num = row["_row_number"]
+            _log(f"INFO  ── Row {row_num} ──────────────────────")
+            sheet.mark_in_progress(row_num)
+
+            rc_col = config.get("sheet_columns", {}).get("retry_count", "Retry_Count")
+            retry_count = int(row.get(rc_col, 0) or 0)
+            attempt = 0
+            success = False
+
+            while attempt <= max_retries and not success:
+                if stop_event.is_set():
+                    break
+
+                proxy_url = proxy_mgr.next_proxy()
+                fingerprint = device_mgr.build_fingerprint(row)
+                # Override JS carrier to match the actual proxy IP carrier
+                if proxy_mgr.current_carrier:
+                    fingerprint["_carrier"] = proxy_mgr.current_carrier
+                carrier = fingerprint.get("_carrier", "unknown")
+                proxy_display = proxy_url or "direct"
+                proxy_type = ProxyManager.proxy_type(proxy_url)
+                proxy_ip = _get_outbound_ip(proxy_url)
+
+                _log(f"INFO  Row {row_num} attempt {attempt+1}/{max_retries+1} | proxy: {proxy_type} ({proxy_ip}) | carrier: {carrier}")
+
+                try:
+                    result = form_filler.process_row(
+                        row=row,
+                        fingerprint=fingerprint,
+                        proxy_url=proxy_url,
+                        row_number=row_num,
+                        stop_event=stop_event,     # ← passed so the filler can abort mid-step
+                    )
+                    sheet.update_row(
+                        row_num, status="Success",
+                        notes=result.get("notes", ""),
+                        proxy_used=proxy_display, ip=proxy_ip,
+                        submission_id=result.get("submission_id", ""),
+                        retry_count=retry_count + attempt,
+                    )
+                    _state["stats"]["success"] += 1
+                    _state["stats"]["processed"] += 1
+                    success = True
+                    _log(f"OK    Row {row_num} → Success ✓")
+
+                except FormFillerError as e:
+                    # ── User pressed Stop mid-fill ──
+                    if e.error_type == "stopped":
+                        sheet.update_row(row_num, status="Stopped",
+                                         notes="[stopped] Run stopped by user",
+                                         proxy_used=proxy_display, ip=proxy_ip,
+                                         retry_count=retry_count + attempt)
+                        _log(f"INFO  Row {row_num} → marked Stopped")
+                        success = True   # prevents retry loop; outer loop will also break
+                        break
+
+                    if e.error_type == "duplicate":
+                        sheet.update_row(row_num, status="Duplicate",
+                                         notes=f"[duplicate] {e}",
+                                         proxy_used=proxy_display, ip=proxy_ip,
+                                         retry_count=retry_count + attempt)
+                        _state["stats"]["duplicate"] += 1
+                        _state["stats"]["processed"] += 1
+                        success = True
+                        _log(f"WARN  Row {row_num} → Duplicate")
+                        break
+
+                    if e.error_type == "missing_data":
+                        sheet.update_row(row_num, status="Failed",
+                                         notes=f"[missing_data] {e}",
+                                         proxy_used=proxy_display, ip=proxy_ip,
+                                         retry_count=retry_count + attempt)
+                        _state["stats"]["failed"] += 1
+                        _state["stats"]["processed"] += 1
+                        success = True
+                        _log(f"ERR   Row {row_num} → Failed (missing data)")
+                        break
+
+                    attempt += 1
+                    if attempt > max_retries:
+                        sheet.update_row(row_num, status="Failed",
+                                         notes=f"[{e.error_type}] {e} (after {attempt} attempts)",
+                                         proxy_used=proxy_display, ip=proxy_ip,
+                                         retry_count=retry_count + attempt)
+                        _state["stats"]["failed"] += 1
+                        _state["stats"]["processed"] += 1
+                        _log(f"ERR   Row {row_num} → Failed after {attempt} attempts ({e.error_type})")
+                    else:
+                        delay = min(backoff_base ** attempt, backoff_max)
+                        sheet.update_row(row_num, status="Retry",
+                                         notes=f"[{e.error_type}] retrying in {delay}s",
+                                         proxy_used=proxy_display, ip=proxy_ip,
+                                         retry_count=retry_count + attempt)
+                        _log(f"RETRY Row {row_num} — waiting {delay}s before next attempt")
+                        for _ in range(int(delay)):
+                            if stop_event.is_set():
+                                break
+                            time.sleep(1)
+
+                except Exception as e:
+                    sheet.update_row(row_num, status="Failed",
+                                     notes=f"[unexpected] {e}",
+                                     proxy_used=proxy_display, ip=proxy_ip,
+                                     retry_count=retry_count + attempt)
+                    _state["stats"]["failed"] += 1
+                    _state["stats"]["processed"] += 1
+                    _log(f"ERR   Row {row_num} → Unexpected error: {e}")
+                    break
+
+        s = _state["stats"]
+        _log(
+            f"DONE  Run complete — "
+            f"Success: {s['success']}  Duplicate: {s['duplicate']}  "
+            f"Failed: {s['failed']}  Processed: {s['processed']}/{s['total']}"
+        )
+
+    except Exception as e:
+        _log(f"FATAL Engine crashed: {type(e).__name__}: {e!r}")
+        _log(traceback.format_exc())
+    finally:
+        _state["running"] = False
+
+
+# ── HTML ──────────────────────────────────────────────────────────────────────
+
+_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Lead Automation Engine</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  background: #0b0e18;
+  color: #e2e8f0;
+  min-height: 100vh;
+  padding: 22px 14px 44px;
+}
+
+.wrap { max-width: 960px; margin: 0 auto; }
+
+h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; letter-spacing: -.5px; }
+.subtitle { font-size: .8rem; color: #4b5563; margin: 3px 0 22px; }
+
+/* ── Cards ── */
+.card {
+  background: #131926;
+  border: 1px solid #1e2d40;
+  border-radius: 12px;
+  padding: 18px 20px;
+  margin-bottom: 14px;
+}
+.card-title {
+  font-size: .68rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 1px;
+  color: #38bdf8; margin-bottom: 13px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+/* ── Offers ── */
+.offers-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 480px) { .offers-grid { grid-template-columns: 1fr; } }
+
+.offer-label {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 11px 13px;
+  border: 2px solid #1e2d40; border-radius: 9px;
+  cursor: pointer; transition: border-color .15s, background .15s;
+}
+.offer-label:hover { border-color: #3b82f6; background: #111827; }
+.offer-label.selected { border-color: #38bdf8; background: #0d1f2d; }
+.offer-label input[type=radio] { display: none; }
+
+.offer-dot {
+  width: 15px; height: 15px; border: 2px solid #374151; border-radius: 50%;
+  flex-shrink: 0; margin-top: 3px; position: relative; transition: border-color .15s;
+}
+.offer-label.selected .offer-dot { border-color: #38bdf8; }
+.offer-label.selected .offer-dot::after {
+  content: ''; position: absolute; inset: 3px;
+  background: #38bdf8; border-radius: 50%;
+}
+.offer-name { font-size: .86rem; font-weight: 600; }
+.offer-url  { font-size: .66rem; color: #4b5563; word-break: break-all; margin-top: 2px; }
+
+/* ── Two-column layout ── */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 270px;
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 640px) { .two-col { grid-template-columns: 1fr; } }
+.left-col { display: flex; flex-direction: column; gap: 14px; }
+
+/* ── Controls ── */
+.status-row { display: flex; align-items: center; gap: 8px; margin-bottom: 13px; font-size: .84rem; }
+.badge {
+  padding: 3px 10px; border-radius: 20px;
+  font-size: .68rem; font-weight: 700; letter-spacing: .5px;
+}
+.badge.idle    { background: #1a2d47; color: #60a5fa; }
+.badge.running { background: #14532d; color: #4ade80; animation: pulse 1.4s infinite; }
+.badge.stopping { background: #431407; color: #fb923c; animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+
+.controls { display: flex; gap: 10px; }
+button {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 10px 22px; font-size: .84rem; font-weight: 600;
+  border: none; border-radius: 8px; cursor: pointer;
+  transition: opacity .15s, transform .1s;
+}
+button:active:not(:disabled) { transform: scale(.97); }
+button:disabled { opacity: .35; cursor: not-allowed; }
+#btn-start { background: #16a34a; color: #f0fdf4; }
+#btn-start:hover:not(:disabled) { background: #22c55e; }
+#btn-stop  { background: #dc2626; color: #fff; }
+#btn-stop:hover:not(:disabled)  { background: #ef4444; }
+
+/* ── Stats ── */
+.stats-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.stat-box {
+  flex: 1; min-width: 66px;
+  background: #0d1117; border: 1px solid #1e2d40;
+  border-radius: 8px; padding: 9px 10px; text-align: center;
+}
+.stat-value { font-size: 1.45rem; font-weight: 700; line-height: 1.1; }
+.stat-label { font-size: .6rem; color: #4b5563; margin-top: 2px; text-transform: uppercase; letter-spacing: .5px; }
+.sv-ok   .stat-value { color: #4ade80; }
+.sv-dup  .stat-value { color: #facc15; }
+.sv-fail .stat-value { color: #f87171; }
+.sv-tot  .stat-value { color: #7dd3fc; }
+
+/* ── Live browser panel ── */
+.phone-wrap {
+  position: relative;
+  background: #07090f;
+  border: 2px solid #1e2d40;
+  border-radius: 14px;
+  overflow: hidden;
+  min-height: 150px;
+}
+.phone-notch {
+  position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+  width: 54px; height: 9px;
+  background: #1e2d40; border-radius: 0 0 7px 7px; z-index: 3;
+}
+#live-img {
+  display: none;
+  width: 100%; height: auto;
+  border-radius: 12px;
+}
+#live-ph {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  min-height: 220px; gap: 10px; padding: 20px; text-align: center;
+}
+.ph-icon { font-size: 2.2rem; opacity: .2; }
+.ph-text { font-size: .74rem; color: #374151; line-height: 1.5; }
+.live-badge {
+  display: none;
+  font-size: .6rem; font-weight: 700; letter-spacing: 1px;
+  color: #4ade80; animation: pulse 1.4s infinite;
+}
+.live-badge.on { display: inline; }
+.step-lbl { font-size: .65rem; color: #374151; text-align: center; margin-top: 7px; min-height: 1em; }
+
+/* ── Log ── */
+#log-box {
+  background: #07090f;
+  border: 1px solid #111827;
+  border-radius: 8px;
+  height: 260px;
+  overflow-y: auto;
+  padding: 11px 13px;
+  font-family: 'JetBrains Mono','Cascadia Code','Fira Code',monospace;
+  font-size: .72rem;
+  line-height: 1.7;
+}
+.ll   { white-space: pre-wrap; word-break: break-all; }
+.ok   { color: #4ade80; }
+.warn { color: #facc15; }
+.err  { color: #f87171; }
+.rty  { color: #fb923c; }
+.done { color: #c4b5fd; font-weight: 600; }
+.ftl  { color: #f43f5e; font-weight: 700; }
+.inf  { color: #64748b; }
+.muted{ color: #1f2937; font-style: italic; }
+.clr-btn {
+  padding: 3px 9px !important; font-size: .65rem !important;
+  background: #1a2535 !important; color: #64748b !important;
+  border-radius: 6px !important;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Lead Automation Engine</h1>
+  <p class="subtitle">Select an offer, then press Start to submit leads from Google Sheets.</p>
+
+  <!-- Offer selection -->
+  <div class="card">
+    <div class="card-title">Select Offer</div>
+    <div class="offers-grid">
+      {% for key, offer in offers.items() %}
+      <label class="offer-label{% if key == '50k_loans' %} selected{% endif %}"
+             id="lbl-{{ key }}" onclick="pickOffer('{{ key }}')">
+        <input type="radio" name="offer" value="{{ key }}"{% if key == '50k_loans' %} checked{% endif %}/>
+        <div class="offer-dot"></div>
+        <div>
+          <div class="offer-name">{{ offer.name }}</div>
+          <div class="offer-url">{{ offer.url }}</div>
+        </div>
+      </label>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Two-column section -->
+  <div class="two-col">
+
+    <!-- Left: controls + stats -->
+    <div class="left-col">
+      <div class="card" style="margin:0">
+        <div class="card-title">Engine Controls</div>
+        <div class="status-row">
+          Status:&nbsp;
+          <span class="badge idle" id="badge">IDLE</span>
+          <span id="status-sub" style="font-size:.76rem;color:#374151;margin-left:4px;"></span>
+        </div>
+        <div class="controls">
+          <button id="btn-start" onclick="startEngine()">&#9654; Start</button>
+          <button id="btn-stop"  onclick="stopEngine()" disabled>&#9632; Stop</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin:0">
+        <div class="card-title">Statistics</div>
+        <div class="stats-row">
+          <div class="stat-box sv-ok">
+            <div class="stat-value" id="s-ok">0</div>
+            <div class="stat-label">Success</div>
+          </div>
+          <div class="stat-box sv-dup">
+            <div class="stat-value" id="s-dup">0</div>
+            <div class="stat-label">Duplicate</div>
+          </div>
+          <div class="stat-box sv-fail">
+            <div class="stat-value" id="s-fail">0</div>
+            <div class="stat-label">Failed</div>
+          </div>
+          <div class="stat-box sv-tot">
+            <div class="stat-value" id="s-proc">0</div>
+            <div class="stat-label">Done</div>
+          </div>
+          <div class="stat-box sv-tot">
+            <div class="stat-value" id="s-tot">0</div>
+            <div class="stat-label">Total</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: live browser view -->
+    <div class="card" style="margin:0">
+      <div class="card-title">
+        Live Browser View
+        <span class="live-badge" id="live-badge">● LIVE</span>
+      </div>
+      <div class="phone-wrap">
+        <div class="phone-notch"></div>
+        <img id="live-img" alt="browser preview"/>
+        <div id="live-ph">
+          <div class="ph-icon">🖥️</div>
+          <div class="ph-text">Browser view appears here<br/>once the engine starts.</div>
+        </div>
+      </div>
+      <div class="step-lbl" id="step-lbl"></div>
+    </div>
+
+  </div>
+
+  <!-- Log -->
+  <div class="card" style="margin-top:14px">
+    <div class="card-title">
+      Live Log
+      <button class="clr-btn" onclick="clearLog()">Clear</button>
+    </div>
+    <div id="log-box">
+      <div class="ll muted">Logs will appear here when the engine starts…</div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ── State ── */
+let selectedOffer = '50k_loans';
+let evtSrc   = null;
+let pollTmr  = null;
+let ssTmr    = null;
+let stopping = false;
+
+/* ── Offer selection ── */
+function pickOffer(key) {
+  selectedOffer = key;
+  document.querySelectorAll('.offer-label').forEach(el => el.classList.remove('selected'));
+  document.getElementById('lbl-' + key).classList.add('selected');
+}
+
+/* ── Log ── */
+function appendLog(line) {
+  const box = document.getElementById('log-box');
+  box.querySelectorAll('.muted').forEach(e => e.remove());
+  const d = document.createElement('div');
+  d.className = 'll ' + logCls(line);
+  d.textContent = line;
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+  const all = box.querySelectorAll('.ll');
+  if (all.length > 500) all[0].remove();
+}
+function logCls(l) {
+  const u = l.toUpperCase();
+  if (u.includes('] OK') || u.includes('SUCCESS'))  return 'ok';
+  if (u.includes('] WARN'))   return 'warn';
+  if (u.includes('] ERR'))    return 'err';
+  if (u.includes('] RETRY'))  return 'rty';
+  if (u.includes('] DONE'))   return 'done';
+  if (u.includes('] FATAL'))  return 'ftl';
+  return 'inf';
+}
+function clearLog() {
+  document.getElementById('log-box').innerHTML = '<div class="ll muted">Log cleared.</div>';
+}
+
+/* ── Stats ── */
+function updStats(s) {
+  document.getElementById('s-ok').textContent   = s.success;
+  document.getElementById('s-dup').textContent  = s.duplicate;
+  document.getElementById('s-fail').textContent = s.failed;
+  document.getElementById('s-proc').textContent = s.processed;
+  document.getElementById('s-tot').textContent  = s.total;
+}
+
+/* ── Running state ── */
+function setRunning(running) {
+  const badge = document.getElementById('badge');
+  document.getElementById('btn-start').disabled = running;
+  document.getElementById('btn-stop').disabled  = !running || stopping;
+  document.getElementById('live-badge').classList.toggle('on', running);
+
+  if (running) {
+    stopping = false;
+    badge.className   = 'badge running';
+    badge.textContent = 'RUNNING';
+    document.getElementById('status-sub').textContent = '';
+  } else {
+    badge.className   = 'badge idle';
+    badge.textContent = 'IDLE';
+    if (stopping) {
+      document.getElementById('status-sub').textContent = '';
+      stopping = false;
+    }
+  }
+}
+
+/* ── Screenshot polling ──
+   Every second, load /screenshot with a cache-busting param.
+   If it returns 200 + a valid image, show it and hide the placeholder.
+   If it returns 204 (file not ready yet), keep showing whatever was last shown.
+*/
+function startSsPoll() {
+  if (ssTmr) clearInterval(ssTmr);
+  ssTmr = setInterval(fetchSs, 1000);
+}
+function stopSsPoll() {
+  if (ssTmr) { clearInterval(ssTmr); ssTmr = null; }
+}
+function fetchSs() {
+  const probe = new Image();
+  probe.onload = () => {
+    const img = document.getElementById('live-img');
+    const ph  = document.getElementById('live-ph');
+    img.src            = probe.src;
+    img.style.display  = 'block';
+    ph.style.display   = 'none';
+  };
+  // onerror: file not created yet or 204 — leave the last good frame visible
+  probe.src = '/screenshot?t=' + Date.now();
+}
+
+/* ── SSE log stream ── */
+function startSSE() {
+  if (evtSrc) evtSrc.close();
+  evtSrc = new EventSource('/logs');
+  evtSrc.onmessage = e => {
+    if (!e.data || !e.data.trim()) return;
+    appendLog(e.data);
+    // Update live step label from form.step events
+    const m = e.data.match(/form\.step.*?step=(\d+).*?title="([^"]+)"/);
+    if (m) document.getElementById('step-lbl').textContent = `Step ${m[1]} of 26: ${m[2]}`;
+  };
+  evtSrc.onerror   = () => setTimeout(startSSE, 2000);
+}
+
+/* ── Status poll (stats + running flag) ── */
+function startPoll() {
+  if (pollTmr) clearInterval(pollTmr);
+  pollTmr = setInterval(async () => {
+    try {
+      const d = await fetch('/status').then(r => r.json());
+      setRunning(d.running);
+      updStats(d.stats);
+      if (!d.running) {
+        clearInterval(pollTmr); pollTmr = null;
+        stopSsPoll();
+        document.getElementById('step-lbl').textContent = '';
+      }
+    } catch (_) {}
+  }, 1500);
+}
+
+/* ── Start ── */
+async function startEngine() {
+  document.getElementById('btn-start').disabled = true;
+  const d = await fetch('/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ offer: selectedOffer }),
+  }).then(r => r.json()).catch(() => ({ ok: false, msg: 'Network error' }));
+
+  if (d.ok) {
+    setRunning(true);
+    startSSE();
+    startPoll();
+    startSsPoll();
+  } else {
+    alert(d.msg || 'Could not start engine.');
+    document.getElementById('btn-start').disabled = false;
+  }
+}
+
+/* ── Stop ── */
+async function stopEngine() {
+  stopping = true;
+  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('badge').className   = 'badge stopping';
+  document.getElementById('badge').textContent = 'STOPPING';
+  document.getElementById('status-sub').textContent = '(finishing current step…)';
+  await fetch('/stop', { method: 'POST' }).catch(() => {});
+}
+
+/* ── Init: sync with server on page load ── */
+(async () => {
+  try {
+    const d = await fetch('/status').then(r => r.json());
+    setRunning(d.running);
+    updStats(d.stats);
+    if (d.running) { startSSE(); startPoll(); startSsPoll(); }
+  } catch (_) {}
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# ── Flask routes ──────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(_HTML, offers=OFFERS)
+
+
+@app.route("/start", methods=["POST"])
+def start():
+    if _state["running"]:
+        return jsonify({"ok": False, "msg": "Engine is already running."})
+    data = request.get_json(silent=True) or {}
+    offer_key = data.get("offer", "50k_loans")
+    offer = OFFERS.get(offer_key, OFFERS["50k_loans"])
+    _state["selected_offer"] = offer_key
+    _state["stop_event"].clear()
+    # Drain stale logs from previous run
+    while not _state["log_queue"].empty():
+        try: _state["log_queue"].get_nowait()
+        except queue.Empty: break
+    t = threading.Thread(target=_run_engine, args=(offer["url"],), daemon=True)
+    _state["thread"] = t
+    t.start()
+    _log(f"INFO  Engine started — offer: {offer['name']}")
+    return jsonify({"ok": True})
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    _state["stop_event"].set()
+    _log("INFO  Stop requested — will halt after the current form step completes…")
+    return jsonify({"ok": True})
+
+
+@app.route("/status")
+def status():
+    return jsonify({"running": _state["running"], "stats": _state["stats"]})
+
+
+@app.route("/screenshot")
+def screenshot():
+    """
+    Serve the live browser screenshot saved by form_filler.
+    Returns 204 (no content) if the file doesn't exist yet so the browser
+    keeps showing its last good frame rather than breaking the <img>.
+    """
+    if not _SS_PATH.exists():
+        return "", 204
+    # Read into memory first so we never block a concurrent write from Playwright
+    try:
+        data = _SS_PATH.read_bytes()
+    except OSError:
+        return "", 204
+    from flask import make_response
+    resp = make_response(data)
+    resp.headers["Content-Type"]  = "image/png"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/logs")
+def logs():
+    def stream():
+        while True:
+            try:
+                msg = _state["log_queue"].get(timeout=1.0)
+                yield f"data: {msg}\n\n"
+            except queue.Empty:
+                yield "data: \n\n"   # keep-alive heartbeat
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("\n  Lead Automation UI")
+    print("  ──────────────────────────────────")
+    print("  Open in browser:  http://localhost:5000\n")
+    app.run(host="0.0.0.0", port=5000, debug=False,
+            use_reloader=False, threaded=True)

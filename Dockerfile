@@ -3,7 +3,10 @@
 # Credentials, .env, logs, and screenshots are mounted at runtime via
 # docker-compose.yml — nothing sensitive is baked into the image.
 
-FROM python:3.11-slim
+# NOTE: pinned to -bookworm (Debian 12). Plain python:3.11-slim now resolves to
+# Debian 13 (Trixie), which Playwright 1.52 doesn't support — `playwright
+# install --with-deps` fails on it (missing ttf-unifont / ttf-ubuntu-font-family).
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 

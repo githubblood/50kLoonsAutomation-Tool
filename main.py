@@ -2,19 +2,18 @@
 """
 main.py — Lead Automation Entry Point
 ──────────────────────────────────────
-Reads pending rows from Google Sheets, rotates proxy + device
-fingerprint per row, fills a web form, and writes results back.
+Reads pending rows from Google Sheets (all 4 tabs) and classifies each
+as Duplicate or Fresh on the live website via email / SSN (no full form).
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import logging.handlers
 import os
 import signal
 import socket
 import sys
-import time
-import traceback
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -32,9 +31,34 @@ from rich.table import Table
 from tqdm import tqdm
 
 from utils.sheet_handler import SheetHandler
-from utils.proxy_manager import ProxyManager
-from utils.device_manager import DeviceManager
-from core.form_filler import FormFiller, FormFillerError
+
+# One tab per offer — website check via matching form filler
+WORKSHEETS: list[tuple[str, str, str, str]] = [
+    (
+        "50k Loans",
+        os.getenv("SHEET_WS_50K", "Sheet1"),
+        "core.form_filler",
+        "https://50kloans.com/",
+    ),
+    (
+        "BorrowMoney",
+        os.getenv("SHEET_WS_BORROW_MONEY", "Sheet2"),
+        "core.form_filler_borrowmoney",
+        "https://borrowmoney.us",
+    ),
+    (
+        "Low Credit",
+        os.getenv("SHEET_WS_LOW_CREDIT", "Sheet3"),
+        "core.form_filler_lowcredit",
+        "https://lowcreditfinance.com",
+    ),
+    (
+        "Super Personal",
+        os.getenv("SHEET_WS_SUPER_PERSONAL", "Sheet4"),
+        "core.form_filler_superpersonal",
+        "https://superpersonalfinder.com",
+    ),
+]
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 
@@ -42,9 +66,6 @@ load_dotenv()  # Load .env into os.environ
 
 console = Console()
 
-# ── Graceful shutdown ────────────────────────────────────────────────
-# Set by SIGTERM handler; main loop checks this flag between rows so the
-# current row always completes and its status is written before we exit.
 _stop_flag: list[bool] = [False]
 
 
@@ -131,179 +152,141 @@ def main() -> None:
     console.print("[bold cyan]║   🚀  Lead Automation Engine  🚀    ║[/]")
     console.print("[bold cyan]╚══════════════════════════════════════╝[/]\n")
 
-    # Initialise components
-    try:
-        sheet = SheetHandler(config)
-    except Exception as e:
-        console.print(f"[bold red]✗ Google Sheets connection failed:[/] {e}")
-        sys.exit(1)
+    sheet_url = os.getenv("GOOGLE_SHEET_URL", "")
+    console.print("[cyan]ℹ  Website classify mode: Duplicate / Fresh (email + SSN on site)[/]")
+    if sheet_url:
+        short = sheet_url if len(sheet_url) <= 60 else sheet_url[:60] + "…"
+        console.print(f"[cyan]ℹ  Workbook: {short}[/]\n")
 
-    proxy_mgr = ProxyManager()
-    device_mgr = DeviceManager(config)
-    form_filler = FormFiller(config)
+    direct_ip = _get_outbound_ip(None)
 
-    retry_cfg = config.get("retry", {})
-    max_retries = retry_cfg.get("max_retries", 3)
-    backoff_base = retry_cfg.get("backoff_base", 2)
-    backoff_max = retry_cfg.get("backoff_max", 30)
+    totals = {"fresh": 0, "duplicate": 0, "failed": 0, "processed": 0}
+    per_sheet: list[tuple[str, str, dict[str, int]]] = []
 
-    # Fetch pending rows
-    pending = sheet.get_pending_rows()
-    if not pending:
-        console.print("[yellow]⚠  No pending rows found. Nothing to do.[/]")
-        return
+    only_worksheet = os.getenv("ONLY_WORKSHEET", "").strip()
 
-    console.print(f"[green]✓ Found {len(pending)} pending row(s)[/]")
-    if proxy_mgr.has_proxies:
-        console.print(f"[green]✓ Loaded {proxy_mgr.total} proxy/proxies[/]")
-    else:
-        console.print("[yellow]⚠ No proxies loaded — running direct[/]")
-
-    # ── Process each row ─────────────────────────────────────────
-    stats = {"success": 0, "failed": 0, "retry": 0, "duplicate": 0}
-
-    for row in tqdm(pending, desc="Processing rows", unit="row"):
+    for offer_name, worksheet, filler_mod, target_url in WORKSHEETS:
+        if only_worksheet and worksheet != only_worksheet:
+            continue
         if _stop_flag[0]:
-            log.warning("main.stop_requested", msg="SIGTERM received — stopping cleanly")
             break
 
-        row_num = row["_row_number"]
-        log.info("row.start", row=row_num)
+        console.print(f"[bold magenta]── {offer_name} ({worksheet}) ──[/]")
 
-        # Lock the row
-        sheet.mark_in_progress(row_num)
+        try:
+            mod = importlib.import_module(filler_mod)
+        except ModuleNotFoundError as e:
+            console.print(f"  [bold red]✗ Form filler not found: {filler_mod}[/]")
+            log.error("filler.missing", module=filler_mod, error=str(e))
+            continue
 
-        # Get current retry count from sheet
-        rc_col = config.get("sheet_columns", {}).get("retry_count", "Retry_Count")
-        retry_count = int(row.get(rc_col, 0) or 0)
+        from core.exceptions import FormFillerError
 
-        attempt = 0
-        success = False
+        FormFiller = mod.FormFiller
 
-        while attempt <= max_retries and not success:
-            # Rotate proxy + fingerprint per attempt
-            proxy_url = proxy_mgr.next_proxy()
-            fingerprint = device_mgr.build_fingerprint(row)
-            proxy_display = proxy_url or "direct"
-            proxy_type = ProxyManager.proxy_type(proxy_url)
+        offer_config = dict(config)
+        offer_config["target"] = {**config.get("target", {}), "url": target_url}
+        ss_dir = Path(f"screenshots/{worksheet}")
+        ss_dir.mkdir(parents=True, exist_ok=True)
+        offer_config.setdefault("screenshots", {})["directory"] = str(ss_dir)
 
-            # Get the actual outbound IP (through proxy if set)
-            proxy_ip = _get_outbound_ip(proxy_url)
+        try:
+            sheet = SheetHandler(config, worksheet_name=worksheet, sheet_url=sheet_url)
+        except Exception as e:
+            console.print(f"  [bold red]✗ Failed to open {worksheet}:[/] {e}")
+            log.error("sheet.connect_failed", worksheet=worksheet, error=str(e))
+            continue
 
-            log.info("row.attempt", row=row_num, attempt=attempt + 1,
-                     proxy_type=proxy_type,
-                     proxy=ProxyManager._mask(proxy_url) if proxy_url else "direct",
-                     proxy_ip=proxy_ip or "direct")
+        form_filler = FormFiller(offer_config)
+
+        pending = sheet.get_pending_rows()
+        if not pending:
+            console.print(f"  [yellow]⚠  No pending rows on {worksheet}[/]")
+            per_sheet.append((offer_name, worksheet, {"fresh": 0, "duplicate": 0, "failed": 0, "pending": 0}))
+            continue
+
+        console.print(f"  [green]✓ {len(pending)} pending row(s) — checking on website[/]")
+        stats = {"fresh": 0, "duplicate": 0, "failed": 0}
+
+        for row in tqdm(pending, desc=f"{worksheet}", unit="row"):
+            if _stop_flag[0]:
+                log.warning("main.stop_requested", msg="SIGTERM received — stopping cleanly")
+                break
+
+            row_num = row["_row_number"]
+            log.info("row.start", worksheet=worksheet, row=row_num, offer=offer_name)
 
             try:
-                result = form_filler.process_row(
+                result = form_filler.classify_lead_on_site(
                     row=row,
-                    fingerprint=fingerprint,
-                    proxy_url=proxy_url,
+                    proxy_url=None,
                     row_number=row_num,
                 )
-                # Success!
+                status = result.get("status", "Fresh")
+                notes = result.get("notes", "")
                 sheet.update_row(
                     row_num,
-                    status="Success",
-                    notes=result.get("notes", ""),
-                    proxy_used=proxy_display,
-                    ip=proxy_ip,
-                    submission_id=result.get("submission_id", ""),
-                    retry_count=retry_count + attempt,
+                    status=status,
+                    notes=notes,
+                    proxy_used="direct",
+                    ip=direct_ip,
                 )
-                stats["success"] += 1
-                success = True
-                console.print(f"  [green]✓ Row {row_num} — Success[/]")
+                if status == "Duplicate":
+                    stats["duplicate"] += 1
+                    console.print(f"  [yellow]⚠ {worksheet} row {row_num} — Duplicate (website)[/]")
+                else:
+                    stats["fresh"] += 1
+                    console.print(f"  [green]✓ {worksheet} row {row_num} — Fresh (website)[/]")
 
             except FormFillerError as e:
-                if e.error_type == "duplicate":
-                    sheet.update_row(
-                        row_num,
-                        status="Duplicate",
-                        notes=f"[duplicate] {e}",
-                        proxy_used=proxy_display,
-                        ip=proxy_ip,
-                        retry_count=retry_count + attempt,
-                    )
-                    stats["duplicate"] += 1
-                    success = True
-                    console.print(f"  [yellow]⚠ Row {row_num} — Duplicate[/]")
-                    break
-
-                if e.error_type == "missing_data":
-                    sheet.update_row(
-                        row_num,
-                        status="Failed",
-                        notes=f"[missing_data] {e}",
-                        proxy_used=proxy_display,
-                        ip=proxy_ip,
-                        retry_count=retry_count + attempt,
-                    )
-                    stats["failed"] += 1
-                    success = True
-                    console.print(f"  [red]✗ Row {row_num} — Failed (missing_data)[/]")
-                    break
-
-                attempt += 1
-                retry_count_now = retry_count + attempt
-                log.warning("row.error", row=row_num, attempt=attempt,
-                            error_type=e.error_type, msg=str(e))
-
-                if attempt > max_retries:
-                    # Exhausted retries
-                    sheet.update_row(
-                        row_num,
-                        status="Failed",
-                        notes=f"[{e.error_type}] {e} (after {attempt} attempts)",
-                        proxy_used=proxy_display,
-                        ip=proxy_ip,
-                        retry_count=retry_count_now,
-                    )
-                    stats["failed"] += 1
-                    console.print(f"  [red]✗ Row {row_num} — Failed ({e.error_type})[/]")
-                else:
-                    # Mark for retry and backoff
-                    delay = min(backoff_base ** attempt, backoff_max)
-                    sheet.update_row(
-                        row_num,
-                        status="Retry",
-                        notes=f"[{e.error_type}] {e} — retrying in {delay}s",
-                        proxy_used=proxy_display,
-                        ip=proxy_ip,
-                        retry_count=retry_count_now,
-                    )
-                    stats["retry"] += 1
-                    log.info("row.backoff", row=row_num, delay=delay)
-                    time.sleep(delay)
-
-            except Exception as e:
-                # Unexpected error — mark failed, move on
-                attempt += 1
-                log.error("row.unexpected_error", row=row_num, error=str(e),
-                          traceback=traceback.format_exc())
                 sheet.update_row(
                     row_num,
                     status="Failed",
-                    notes=f"[unexpected] {e}",
-                    proxy_used=proxy_display,
-                    ip=proxy_ip,
-                    retry_count=retry_count + attempt,
+                    notes=f"[{e.error_type}] {e}",
+                    proxy_used="direct",
+                    ip=direct_ip,
                 )
                 stats["failed"] += 1
-                console.print(f"  [red]✗ Row {row_num} — Unexpected error[/]")
-                break  # Don't retry unexpected errors
+                console.print(f"  [red]✗ {worksheet} row {row_num} — Failed ({e.error_type})[/]")
+                log.warning("row.classify_failed", row=row_num, error=str(e))
 
-    # ── Summary ──────────────────────────────────────────────────
+        totals["fresh"] += stats["fresh"]
+        totals["duplicate"] += stats["duplicate"]
+        totals["failed"] += stats["failed"]
+        totals["processed"] += len(pending)
+        per_sheet.append((offer_name, worksheet, {**stats, "pending": len(pending)}))
+        console.print()
+
+    if not per_sheet:
+        console.print("[yellow]⚠  Could not process any worksheets.[/]")
+        return
+
     console.print()
-    table = Table(title="📊 Run Summary", show_header=True, header_style="bold magenta")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Count", justify="right", style="bold")
-    table.add_row("✅ Success", str(stats["success"]))
-    table.add_row("🟨 Duplicate", str(stats["duplicate"]))
-    table.add_row("❌ Failed", str(stats["failed"]))
-    table.add_row("🔄 Retried (intermediate)", str(stats["retry"]))
-    table.add_row("📋 Total Processed", str(len(pending)))
+    table = Table(title="📊 Run Summary (website check, all sheets)", show_header=True, header_style="bold magenta")
+    table.add_column("Offer", style="cyan")
+    table.add_column("Tab", style="dim")
+    table.add_column("Fresh", justify="right", style="green")
+    table.add_column("Duplicate", justify="right", style="yellow")
+    table.add_column("Failed", justify="right", style="red")
+    table.add_column("Rows", justify="right", style="bold")
+    for offer_name, worksheet, s in per_sheet:
+        table.add_row(
+            offer_name,
+            worksheet,
+            str(s.get("fresh", 0)),
+            str(s.get("duplicate", 0)),
+            str(s.get("failed", 0)),
+            str(s.get("pending", 0)),
+        )
+    table.add_section()
+    table.add_row(
+        "TOTAL",
+        "",
+        str(totals["fresh"]),
+        str(totals["duplicate"]),
+        str(totals["failed"]),
+        str(totals["processed"]),
+    )
     console.print(table)
     console.print()
 
